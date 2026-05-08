@@ -1,4 +1,5 @@
-use veryl_aligner::{Aligner, Location, Measure, align_kind};
+use std::rc::Rc;
+use veryl_aligner::{Aligner, Location, align_kind};
 use veryl_analyzer::attribute::{AlignItem, FormatItem};
 use veryl_analyzer::attribute_table;
 use veryl_metadata::{Format, Metadata};
@@ -8,28 +9,53 @@ use veryl_parser::token_range::TokenExt;
 use veryl_parser::veryl_grammar_trait::*;
 use veryl_parser::veryl_token::{Token, VerylToken};
 use veryl_parser::veryl_walker::VerylWalker;
+use veryl_pretty::doc::{self, CommentDoc, Doc};
+use veryl_pretty::render::{RenderOpts, render};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
-    Emit,
+    /// Pass 1: feed tokens to the aligner so it can compute per-column
+    /// padding additions. No output is produced.
     Align,
+    /// Pass 2: build a `Doc` IR tree in `self.doc_buffer`. The tree is
+    /// rendered into `self.string` once walking finishes.
+    Emit,
 }
 
 pub struct Formatter {
+    // ----- Configuration ---------------------------------------------------
     mode: Mode,
     format_opt: Format,
     newline: &'static str,
+
+    // ----- Output / Doc IR build state -------------------------------------
+    /// Final rendered Veryl text, populated by `format()` after the renderer
+    /// runs.
     string: String,
+    /// Stack of currently-assembling `Doc` buffers. The innermost vec holds
+    /// the children of whatever indent block is currently open. Used only in
+    /// `Mode::Emit`.
+    doc_buffer: Vec<Vec<Doc>>,
+    /// Tracks the last character we emitted (Doc-IR side). Used by code that
+    /// needs to peek at the tail of the (rendered) output, since that output
+    /// isn't materialized until the renderer runs.
+    last_emitted_char: Option<char>,
+
+    // ----- Position / token tracking ---------------------------------------
     indent: usize,
     line: u32,
+    adjust_line: bool,
     aligner: Aligner,
-    measure: Measure,
-    in_start_token: bool,
-    consumed_next_newline: bool,
+
+    // ----- Layout mode stacks ----------------------------------------------
     single_line: Vec<()>,
     multi_line: Vec<()>,
-    adjust_line: bool,
+
+    // ----- Token / comment processing flags --------------------------------
+    in_start_token: bool,
     keep_tail_newline: bool,
+
+    // ----- Walker context flags ("are we currently inside X?") -------------
     in_scalar_type: bool,
     in_expression: Vec<()>,
     in_attribute: bool,
@@ -42,17 +68,22 @@ impl Default for Formatter {
             mode: Mode::Emit,
             format_opt: Format::default(),
             newline: "\n",
+
             string: String::new(),
+            doc_buffer: Vec::new(),
+            last_emitted_char: None,
+
             indent: 0,
             line: 1,
+            adjust_line: false,
             aligner: Aligner::new(),
-            measure: Measure::default(),
-            in_start_token: false,
-            consumed_next_newline: false,
+
             single_line: Vec::new(),
             multi_line: Vec::new(),
-            adjust_line: false,
+
+            in_start_token: false,
             keep_tail_newline: false,
+
             in_scalar_type: false,
             in_expression: Vec::new(),
             in_attribute: false,
@@ -78,61 +109,89 @@ impl Formatter {
             self.aligner.gather_additions();
         }
         self.mode = Mode::Emit;
+        self.doc_buffer = vec![Vec::new()];
         self.veryl(input);
+        let top = self.doc_buffer.pop().unwrap_or_default();
+        let doc = doc::concat(top);
+        let opts = RenderOpts {
+            max_width: self.format_opt.max_width,
+            indent_width: self.format_opt.indent_width,
+            newline: self.newline,
+            strip_trailing_whitespace: true,
+        };
+        self.string = render(&doc, &opts);
     }
 
     pub fn as_str(&self) -> &str {
         &self.string
     }
 
+    /// Push a `Doc` node onto the innermost buffer. No-op in `Mode::Align`
+    /// so call sites can emit doc-only nodes (e.g. `Doc::UserBreak`)
+    /// unconditionally without guarding the mode.
+    fn emit_doc(&mut self, d: Doc) {
+        if !matches!(self.mode, Mode::Emit) {
+            return;
+        }
+        if matches!(d, Doc::Nil) {
+            return;
+        }
+        self.doc_buffer
+            .last_mut()
+            .expect("doc_buffer must have at least one frame in Mode::Emit")
+            .push(d);
+    }
+
+    /// Open a new indent block (one level deeper). Subsequent `emit_doc`
+    /// calls accumulate into the new frame until `pop_indent_block` is
+    /// called.
+    fn push_indent_block(&mut self) {
+        self.doc_buffer.push(Vec::new());
+    }
+
+    /// Close the innermost indent block: take its accumulated docs, wrap
+    /// them in `Doc::Indent(+1, _)`, and push the result onto the parent
+    /// frame.
+    fn pop_indent_block(&mut self) {
+        let inner = self.doc_buffer.pop().expect("indent block underflow");
+        let nested = doc::indent_by(1, doc::concat(inner));
+        if !matches!(nested, Doc::Nil) {
+            self.doc_buffer
+                .last_mut()
+                .expect("indent block has no parent")
+                .push(nested);
+        }
+    }
+
     fn str(&mut self, x: &str) {
         match self.mode {
             Mode::Emit => {
-                self.string.push_str(x);
+                if let Some(c) = x.chars().next_back() {
+                    self.last_emitted_char = Some(c);
+                }
+                self.emit_doc(doc::text(x));
             }
             Mode::Align => {
                 self.aligner.space(x.len());
-                self.measure.add(x.len() as u32);
             }
         }
-    }
-
-    fn unindent(&mut self) {
-        if self.mode == Mode::Align {
-            return;
-        }
-
-        let indent_width = self.indent * self.format_opt.indent_width;
-        if self.string.ends_with(&" ".repeat(indent_width)) {
-            self.string.truncate(self.string.len() - indent_width);
-        }
-    }
-
-    fn indent(&mut self) {
-        if self.mode == Mode::Align {
-            return;
-        }
-
-        let indent_width = self.indent * self.format_opt.indent_width;
-        self.str(&" ".repeat(indent_width));
     }
 
     fn newline_push(&mut self) {
         if self.single_line() {
             self.space(1);
-        } else {
-            if self.mode == Mode::Align {
-                return;
-            }
-
-            self.unindent();
-            if !self.consumed_next_newline {
-                self.str(self.newline);
-            } else {
-                self.consumed_next_newline = false;
-            }
+            return;
+        }
+        if matches!(self.mode, Mode::Emit) {
+            // Open a +1 indent block. The hardline emitted inside it
+            // indents to (current + 1) at render time. If a preceding line
+            // comment already produced `\n`, the renderer's
+            // swallow-next-break flag turns this hardline into an
+            // indent-only emission.
+            self.push_indent_block();
+            self.emit_doc(Doc::Hardline);
+            self.last_emitted_char = Some('\n');
             self.indent += 1;
-            self.indent();
             self.adjust_line = true;
         }
     }
@@ -140,44 +199,28 @@ impl Formatter {
     fn newline_pop(&mut self) {
         if self.single_line() {
             self.space(1);
-        } else {
-            if self.mode == Mode::Align {
-                return;
-            }
-
-            self.unindent();
-            if !self.consumed_next_newline {
-                self.str(self.newline);
-            } else {
-                self.consumed_next_newline = false;
-            }
-            self.indent -= 1;
-            self.indent();
-            self.adjust_line = true;
+            return;
         }
-    }
-
-    fn newline_tail_pop(&mut self) {
-        if !self.single_line() {
-            self.newline_pop();
+        if matches!(self.mode, Mode::Emit) {
+            // Close the +1 indent block. The trailing hardline (the one
+            // that produces the newline before the closing `}`) lives at
+            // the parent indent level.
+            self.pop_indent_block();
+            self.indent -= 1;
+            self.emit_doc(Doc::Hardline);
+            self.last_emitted_char = Some('\n');
+            self.adjust_line = true;
         }
     }
 
     fn newline(&mut self) {
         if self.single_line() {
             self.space(1);
-        } else {
-            if self.mode == Mode::Align {
-                return;
-            }
-
-            self.unindent();
-            if !self.consumed_next_newline {
-                self.str(self.newline);
-            } else {
-                self.consumed_next_newline = false;
-            }
-            self.indent();
+            return;
+        }
+        if matches!(self.mode, Mode::Emit) {
+            self.emit_doc(Doc::Hardline);
+            self.last_emitted_char = Some('\n');
             self.adjust_line = true;
         }
     }
@@ -206,6 +249,85 @@ impl Formatter {
         self.str(&" ".repeat(repeat));
     }
 
+    /// Open a sub-buffer used to capture child Docs for later wrapping. No-op
+    /// outside `Mode::Emit` (where there's no doc tree to capture).
+    fn buf_begin(&mut self) {
+        if matches!(self.mode, Mode::Emit) {
+            self.doc_buffer.push(Vec::new());
+        }
+    }
+
+    /// Close the innermost sub-buffer and return its contents as a single
+    /// `Doc` (concatenated). Outside `Mode::Emit` returns `Doc::Nil`.
+    fn buf_end_concat(&mut self) -> Doc {
+        if matches!(self.mode, Mode::Emit) {
+            let inner = self.doc_buffer.pop().expect("buf underflow");
+            doc::concat(inner)
+        } else {
+            Doc::Nil
+        }
+    }
+
+    /// Wrap the next emissions in a Wadler `group`. Pair with `group_end`.
+    fn group_begin(&mut self) {
+        self.buf_begin();
+    }
+
+    fn group_end(&mut self) {
+        if matches!(self.mode, Mode::Emit) {
+            let inner = self.buf_end_concat();
+            self.emit_doc(doc::group(inner));
+        }
+    }
+
+    /// Wrap the next emissions in a `+1` indent block. Doc-tree-only: does
+    /// not bump `self.indent` (which is only used by `newline_push/pop`
+    /// and the aligner indexing).
+    fn group_nest_begin(&mut self) {
+        self.buf_begin();
+    }
+
+    fn group_nest_end(&mut self) {
+        if matches!(self.mode, Mode::Emit) {
+            let inner = self.buf_end_concat();
+            self.emit_doc(doc::indent_by(1, inner));
+        }
+    }
+
+    /// Soft line: a space when the enclosing group fits flat, a newline +
+    /// indent when it breaks. Falls back to a regular space outside
+    /// `Mode::Emit`.
+    fn soft_line(&mut self) {
+        match self.mode {
+            Mode::Emit => self.emit_doc(doc::line()),
+            _ => self.space(1),
+        }
+    }
+
+    /// Soft break: nothing when the enclosing group fits flat, a newline +
+    /// indent when it breaks. Used for positions like immediately after `(`
+    /// that should be tight on a single line but expand when the call wraps.
+    fn soft_break(&mut self) {
+        if matches!(self.mode, Mode::Emit) {
+            self.emit_doc(doc::softline());
+        }
+    }
+
+    /// Outer break for a list-like construct (positions immediately after
+    /// `{` / `(` / `[` and just before the closing brace). Emits
+    /// `UserBreak` when the user broke the surrounding pair across lines,
+    /// otherwise a soft break. No-op in `Mode::Align`.
+    fn list_outer_break(&mut self, user_broken: bool) {
+        if !matches!(self.mode, Mode::Emit) {
+            return;
+        }
+        if user_broken {
+            self.emit_doc(Doc::UserBreak);
+        } else {
+            self.soft_break();
+        }
+    }
+
     fn consume_adjust_line(&mut self, x: &Token) {
         if self.adjust_line && x.line > self.line + 1 {
             self.newline();
@@ -217,7 +339,6 @@ impl Formatter {
         self.consume_adjust_line(x);
         let text = resource_table::get_str_value(x.text).unwrap();
         let text = if !self.keep_tail_newline && text.ends_with('\n') {
-            self.consumed_next_newline = true;
             text.trim_end()
         } else {
             &text
@@ -230,43 +351,59 @@ impl Formatter {
     fn process_token(&mut self, x: &VerylToken, will_push: bool) {
         match self.mode {
             Mode::Emit => {
+                // Main token text.
                 self.push_token(&x.token);
 
+                // Aligner-supplied padding directly after the token.
                 let loc: Location = x.token.into();
                 if let Some(width) = self.aligner.additions.get(&loc) {
                     self.space(*width as usize);
                 }
 
-                // temporary indent to adjust indent of comments with the next push
-                if will_push {
-                    self.indent += 1;
-                }
-                // detect line comment newline which will consume the next newline
-                self.consumed_next_newline = false;
-                for x in &x.comments {
-                    // insert space between comments in the same line
-                    if x.line == self.line && !self.in_start_token {
-                        self.space(1);
+                // Trailing comments are emitted as a single `Doc::Comments`
+                // node, optionally wrapped in `+1` indent when the next
+                // thing produced will be a `{` followed by a `newline_push`.
+                if !x.comments.is_empty() {
+                    let mut cs: Vec<CommentDoc> = Vec::with_capacity(x.comments.len());
+                    let mut prev_line = self.line;
+                    for c in &x.comments {
+                        let raw = resource_table::get_str_value(c.text).unwrap();
+                        let is_line_comment = raw.ends_with('\n');
+                        let trimmed: String = if is_line_comment {
+                            raw.trim_end().to_string()
+                        } else {
+                            raw.clone()
+                        };
+                        let leading_newlines = c.line.saturating_sub(prev_line);
+                        cs.push(CommentDoc {
+                            text: Rc::<str>::from(trimmed.as_str()),
+                            leading_newlines,
+                            is_line_comment,
+                            src_line: 0,
+                            src_column: 0,
+                        });
+                        // Advance our notion of the source line. For line
+                        // comments the trailing `\n` is consumed; for block
+                        // comments we add any embedded newlines from the
+                        // body.
+                        let raw_nls = raw.matches('\n').count() as u32;
+                        let trailing = if is_line_comment {
+                            raw_nls.saturating_sub(1)
+                        } else {
+                            raw_nls
+                        };
+                        prev_line = c.line + trailing;
                     }
-                    for _ in 0..x.line - self.line {
-                        self.unindent();
-                        self.str(self.newline);
-                        self.indent();
+                    self.line = prev_line;
+                    let mut node = doc::comments(cs);
+                    if will_push {
+                        node = doc::indent_by(1, node);
                     }
-                    self.push_token(x);
-                }
-                if will_push {
-                    self.indent -= 1;
-                }
-                if self.consumed_next_newline {
-                    self.unindent();
-                    self.str(self.newline);
-                    self.indent();
+                    self.emit_doc(node);
                 }
             }
             Mode::Align => {
                 self.aligner.token(x);
-                self.measure.add(x.token.length);
             }
         }
     }
@@ -328,22 +465,6 @@ impl Formatter {
                 .and_modify(|val| *val += width as u32)
                 .or_insert(width as u32);
         }
-    }
-
-    fn measure_start(&mut self) {
-        if self.mode == Mode::Align {
-            self.measure.start();
-        }
-    }
-
-    fn measure_finish(&mut self, token: &Token) {
-        if self.mode == Mode::Align {
-            self.measure.finish(token.id);
-        }
-    }
-
-    fn measure_get(&mut self, token: &Token) -> Option<u32> {
-        self.measure.get(token.id)
     }
 
     fn single_line_start(&mut self) {
@@ -516,52 +637,67 @@ impl VerylWalker for Formatter {
     fn if_expression(&mut self, arg: &IfExpression) {
         if arg.if_expression_list.is_empty() {
             self.expression01(&arg.expression01);
-        } else {
-            self.measure_start();
-
-            let single_line = if self.mode == Mode::Align {
-                // calc line width as single_line in Align mode (the same as in emitter)
-                true
-            } else if let Some(width) = self.measure_get(&arg.first()) {
-                let compact = attribute_table::is_format(&arg.first(), FormatItem::Compact);
-                (width < self.format_opt.max_width as u32) || compact
-            } else {
-                // vertical align mode is off.
-                // Use single line mode forcely.
-                true
-            };
-            if single_line {
-                self.single_line_start();
-            }
-
-            for (i, x) in arg.if_expression_list.iter().enumerate() {
+            return;
+        }
+        let compact = attribute_table::is_format(&arg.first(), FormatItem::Compact);
+        if compact {
+            // Force single-line layout via the `single_line` stack so
+            // every separator stays a literal space regardless of width.
+            self.single_line_start();
+            for x in arg.if_expression_list.iter() {
                 self.r#if(&x.r#if);
                 self.space(1);
                 self.expression(&x.expression);
-
                 self.space(1);
-                self.token_will_push(&x.question.question_token);
-                self.newline_push();
+                self.question(&x.question);
+                self.space(1);
                 self.expression(&x.expression0);
-                self.newline_pop();
-
-                if (i + 1) < arg.if_expression_list.len() {
-                    self.colon(&x.colon);
-                    self.space(1);
-                } else {
-                    self.token_will_push(&x.colon.colon_token);
-                }
+                self.space(1);
+                self.colon(&x.colon);
+                self.space(1);
             }
-
-            self.newline_push();
             self.expression01(&arg.expression01);
-            self.newline_tail_pop();
-
-            self.measure_finish(&arg.first());
-            if single_line {
-                self.single_line_finish();
+            self.single_line_finish();
+            return;
+        }
+        // Group's `fits_flat` chooses between inline and multi-line. The
+        // broken layout indents each then-branch one level past the `?`:
+        //
+        //     if cond1 ?
+        //         then1
+        //     : if cond2 ?
+        //         then2
+        //     :
+        //         else
+        self.group_begin();
+        for (i, x) in arg.if_expression_list.iter().enumerate() {
+            self.r#if(&x.r#if);
+            self.space(1);
+            self.expression(&x.expression);
+            self.space(1);
+            self.token_will_push(&x.question.question_token);
+            self.group_nest_begin();
+            self.soft_line();
+            self.expression(&x.expression0);
+            self.group_nest_end();
+            if (i + 1) < arg.if_expression_list.len() {
+                self.soft_line();
+                self.colon(&x.colon);
+                self.space(1);
+            } else {
+                self.soft_line();
+                self.token_will_push(&x.colon.colon_token);
             }
         }
+        self.group_nest_begin();
+        self.soft_line();
+        self.expression01(&arg.expression01);
+        self.group_nest_end();
+        // When the group breaks, drop the trailing semicolon (or
+        // surrounding context) onto a new line at the outer indent. In
+        // flat mode this emits nothing.
+        self.soft_break();
+        self.group_end();
     }
 
     /// Semantic action for non-terminal 'Expression01'
@@ -569,13 +705,26 @@ impl VerylWalker for Formatter {
     // https://github.com/rust-lang/rust/issues/106211
     #[inline(never)]
     fn expression01(&mut self, arg: &Expression01) {
+        if arg.expression01_list.is_empty() {
+            self.expression02(&arg.expression02);
+            return;
+        }
+        // Each "<op> <rhs>" segment lives in its own group with a leading
+        // soft line, wrapped in an outer group + nest so continuation
+        // lines indent one level past the surrounding statement.
+        self.group_begin();
+        self.group_nest_begin();
         self.expression02(&arg.expression02);
         for x in &arg.expression01_list {
-            self.space(1);
+            self.group_begin();
+            self.soft_line();
             self.expression01_op(&x.expression01_op);
             self.space(1);
             self.expression02(&x.expression02);
+            self.group_end();
         }
+        self.group_nest_end();
+        self.group_end();
     }
 
     /// Semantic action for non-terminal 'Expression01Op'
@@ -621,24 +770,38 @@ impl VerylWalker for Formatter {
                 self.r_paren(&x.r_paren);
             }
             Factor::LBraceConcatenationListRBrace(x) => {
-                if x.l_brace.line() != x.r_brace.line() {
+                let user_broken = x.l_brace.line() != x.r_brace.line();
+                if user_broken {
                     self.multi_line_start();
                 }
+                self.group_begin();
                 self.l_brace(&x.l_brace);
+                self.group_nest_begin();
+                self.list_outer_break(user_broken);
                 self.concatenation_list(&x.concatenation_list);
+                self.group_nest_end();
+                self.list_outer_break(user_broken);
                 self.r_brace(&x.r_brace);
-                if x.l_brace.line() != x.r_brace.line() {
+                self.group_end();
+                if user_broken {
                     self.multi_line_finish();
                 }
             }
             Factor::QuoteLBraceArrayLiteralListRBrace(x) => {
-                if x.quote_l_brace.line() != x.r_brace.line() {
+                let user_broken = x.quote_l_brace.line() != x.r_brace.line();
+                if user_broken {
                     self.multi_line_start();
                 }
+                self.group_begin();
                 self.quote_l_brace(&x.quote_l_brace);
+                self.group_nest_begin();
+                self.list_outer_break(user_broken);
                 self.array_literal_list(&x.array_literal_list);
+                self.group_nest_end();
+                self.list_outer_break(user_broken);
                 self.r_brace(&x.r_brace);
-                if x.quote_l_brace.line() != x.r_brace.line() {
+                self.group_end();
+                if user_broken {
                     self.multi_line_finish();
                 }
             }
@@ -689,19 +852,42 @@ impl VerylWalker for Formatter {
         };
         self.in_named_argument.push(in_named_argument);
         if in_named_argument {
+            // Named arguments always force multi-line layout, never
+            // width-driven wrapping.
             self.token_will_push(&arg.l_paren.l_paren_token);
             self.newline_push();
             self.align_reset();
-        } else {
-            self.l_paren(&arg.l_paren);
-        }
-        if let Some(ref x) = arg.function_call_opt {
-            self.argument_list(&x.argument_list);
-        }
-        if in_named_argument {
+            if let Some(ref x) = arg.function_call_opt {
+                self.argument_list(&x.argument_list);
+            }
             self.newline_pop();
+            self.r_paren(&arg.r_paren);
+        } else {
+            // Positional arguments wrap based on `max_width` via Group.
+            // `UserBreak` honors the user's choice when they broke `(` and
+            // `)` across lines, forcing the surrounding group into break
+            // mode regardless of width.
+            let user_broken = arg.l_paren.line() != arg.r_paren.line();
+            self.group_begin();
+            self.l_paren(&arg.l_paren);
+            if let Some(ref x) = arg.function_call_opt {
+                self.group_nest_begin();
+                if user_broken {
+                    self.emit_doc(Doc::UserBreak);
+                } else {
+                    self.soft_break();
+                }
+                self.argument_list(&x.argument_list);
+                self.group_nest_end();
+                if user_broken {
+                    self.emit_doc(Doc::UserBreak);
+                } else {
+                    self.soft_break();
+                }
+            }
+            self.r_paren(&arg.r_paren);
+            self.group_end();
         }
-        self.r_paren(&arg.r_paren);
         self.in_named_argument.pop();
     }
 
@@ -714,7 +900,7 @@ impl VerylWalker for Formatter {
             if *self.in_named_argument.last().unwrap() {
                 self.newline();
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.argument_item(&x.argument_item);
         }
@@ -741,32 +927,36 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'StructConstructor'
     fn struct_constructor(&mut self, arg: &StructConstructor) {
-        if arg.quote_l_brace.line() != arg.r_brace.line() {
+        let user_broken = arg.quote_l_brace.line() != arg.r_brace.line();
+        if user_broken {
             self.multi_line_start();
         }
+        self.group_begin();
         self.quote_l_brace(&arg.quote_l_brace);
-        if self.multi_line() {
-            self.newline_push();
-        }
+        self.group_nest_begin();
+        self.list_outer_break(user_broken);
         self.struct_constructor_list(&arg.struct_constructor_list);
         if let Some(ref x) = arg.struct_constructor_opt {
-            if self.multi_line() {
-                self.newline();
+            self.group_begin();
+            // We don't have a robust last-token line for the list here,
+            // so fall back to the outer user_broken flag for this segment.
+            if user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.dot_dot(&x.dot_dot);
             self.defaul(&x.defaul);
             self.l_paren(&x.l_paren);
             self.expression(&x.expression);
             self.r_paren(&x.r_paren);
+            self.group_end();
         }
-        if self.multi_line() {
-            self.newline_pop();
-            self.align_reset();
-        }
+        self.group_nest_end();
+        self.list_outer_break(user_broken);
         self.r_brace(&arg.r_brace);
-        if arg.quote_l_brace.line() != arg.r_brace.line() {
+        self.group_end();
+        if user_broken {
             self.multi_line_finish();
         }
     }
@@ -775,13 +965,16 @@ impl VerylWalker for Formatter {
     fn struct_constructor_list(&mut self, arg: &StructConstructorList) {
         self.struct_constructor_item(&arg.struct_constructor_item);
         for x in &arg.struct_constructor_list_list {
+            let item_user_broken = x.comma.line() != x.struct_constructor_item.line();
+            self.group_begin();
             self.comma(&x.comma);
-            if x.comma.line() != x.struct_constructor_item.line() {
-                self.newline();
+            if item_user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.struct_constructor_item(&x.struct_constructor_item);
+            self.group_end();
         }
         if let Some(ref x) = arg.struct_constructor_list_opt {
             self.comma(&x.comma);
@@ -802,24 +995,28 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'ConcatenationList'
     fn concatenation_list(&mut self, arg: &ConcatenationList) {
-        if self.multi_line() {
-            self.newline_push();
-        }
         self.concatenation_item(&arg.concatenation_item);
         for x in &arg.concatenation_list_list {
+            let item_user_broken = x.comma.line() != x.concatenation_item.line();
+            // Fill mode: each ",<sep>item" segment lives in its own group
+            // so it can stay flat next to the previous item even when the
+            // outer group is in break mode.
+            self.group_begin();
             self.comma(&x.comma);
-            if x.comma.line() != x.concatenation_item.line() {
-                self.newline();
+            if item_user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.concatenation_item(&x.concatenation_item);
+            self.group_end();
         }
         if let Some(ref x) = arg.concatenation_list_opt {
             self.comma(&x.comma);
         }
+        // Mode::Align needs an explicit aligner reset so column groups
+        // don't bleed into whatever construct follows the list.
         if self.multi_line() {
-            self.newline_pop();
             self.align_reset();
         }
     }
@@ -837,24 +1034,23 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'ArrayLiteralList'
     fn array_literal_list(&mut self, arg: &ArrayLiteralList) {
-        if self.multi_line() {
-            self.newline_push();
-        }
         self.array_literal_item(&arg.array_literal_item);
         for x in &arg.array_literal_list_list {
+            let item_user_broken = x.comma.line() != x.array_literal_item.line();
+            self.group_begin();
             self.comma(&x.comma);
-            if x.comma.line() != x.array_literal_item.line() {
-                self.newline();
+            if item_user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.array_literal_item(&x.array_literal_item);
+            self.group_end();
         }
         if let Some(ref x) = arg.array_literal_list_opt {
             self.comma(&x.comma);
         }
         if self.multi_line() {
-            self.newline_pop();
             self.align_reset();
         }
     }
@@ -973,9 +1169,22 @@ impl VerylWalker for Formatter {
         self.space(1);
         self.expression(&arg.expression);
         self.space(1);
-        self.l_brace(&arg.l_brace);
-        self.range_list(&arg.range_list);
-        self.r_brace(&arg.r_brace);
+        let user_broken = arg.l_brace.line() != arg.r_brace.line();
+        if matches!(self.mode, Mode::Emit) {
+            self.group_begin();
+            self.l_brace(&arg.l_brace);
+            self.group_nest_begin();
+            self.list_outer_break(user_broken);
+            self.range_list(&arg.range_list);
+            self.group_nest_end();
+            self.list_outer_break(user_broken);
+            self.r_brace(&arg.r_brace);
+            self.group_end();
+        } else {
+            self.l_brace(&arg.l_brace);
+            self.range_list(&arg.range_list);
+            self.r_brace(&arg.r_brace);
+        }
     }
 
     /// Semantic action for non-terminal 'OutsideExpression'
@@ -984,18 +1193,43 @@ impl VerylWalker for Formatter {
         self.space(1);
         self.expression(&arg.expression);
         self.space(1);
-        self.l_brace(&arg.l_brace);
-        self.range_list(&arg.range_list);
-        self.r_brace(&arg.r_brace);
+        let user_broken = arg.l_brace.line() != arg.r_brace.line();
+        if matches!(self.mode, Mode::Emit) {
+            self.group_begin();
+            self.l_brace(&arg.l_brace);
+            self.group_nest_begin();
+            self.list_outer_break(user_broken);
+            self.range_list(&arg.range_list);
+            self.group_nest_end();
+            self.list_outer_break(user_broken);
+            self.r_brace(&arg.r_brace);
+            self.group_end();
+        } else {
+            self.l_brace(&arg.l_brace);
+            self.range_list(&arg.range_list);
+            self.r_brace(&arg.r_brace);
+        }
     }
 
     /// Semantic action for non-terminal 'RangeList'
     fn range_list(&mut self, arg: &RangeList) {
+        let in_build = matches!(self.mode, Mode::Emit);
         self.range_item(&arg.range_item);
         for x in &arg.range_list_list {
-            self.comma(&x.comma);
-            self.space(1);
-            self.range_item(&x.range_item);
+            if in_build {
+                // Fill mode: each ",<sep>item" segment is its own group so a
+                // long range list can wrap based on max_width while keeping
+                // user-grouped items together.
+                self.group_begin();
+                self.comma(&x.comma);
+                self.soft_line();
+                self.range_item(&x.range_item);
+                self.group_end();
+            } else {
+                self.comma(&x.comma);
+                self.space(1);
+                self.range_item(&x.range_item);
+            }
         }
         if let Some(ref x) = arg.range_list_opt {
             self.comma(&x.comma);
@@ -2141,22 +2375,33 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'WithGenericParameter'
     fn with_generic_parameter(&mut self, arg: &WithGenericParameter) {
-        if arg.colon_colon_l_angle.line() != arg.r_angle.line() {
+        let user_broken = arg.colon_colon_l_angle.line() != arg.r_angle.line();
+        // Column alignment is only meaningful when every item starts at
+        // its own line. Items packed in fill layout share a line, so the
+        // per-item padding wouldn't produce any visible alignment.
+        let items_per_line_broken = user_broken && {
+            let list = &arg.with_generic_parameter_list;
+            let first_broken =
+                arg.colon_colon_l_angle.line() != list.with_generic_parameter_item.first().line;
+            let rest_broken = list
+                .with_generic_parameter_list_list
+                .iter()
+                .all(|x| x.comma.line() != x.with_generic_parameter_item.first().line);
+            first_broken && rest_broken
+        };
+        if items_per_line_broken {
             self.multi_line_start();
         }
+        self.group_begin();
         self.colon_colon_l_angle(&arg.colon_colon_l_angle);
-        if self.multi_line() {
-            self.newline_push();
-        }
-
+        self.group_nest_begin();
+        self.list_outer_break(user_broken);
         self.with_generic_parameter_list(&arg.with_generic_parameter_list);
-
-        if self.multi_line() {
-            self.newline_pop();
-            self.align_reset();
-        }
+        self.group_nest_end();
+        self.list_outer_break(user_broken);
         self.r_angle(&arg.r_angle);
-        if arg.colon_colon_l_angle.line() != arg.r_angle.line() {
+        self.group_end();
+        if items_per_line_broken {
             self.multi_line_finish();
         }
     }
@@ -2165,21 +2410,19 @@ impl VerylWalker for Formatter {
     fn with_generic_parameter_list(&mut self, arg: &WithGenericParameterList) {
         self.with_generic_parameter_item(&arg.with_generic_parameter_item);
         for x in &arg.with_generic_parameter_list_list {
+            let item_user_broken = x.comma.line() != x.with_generic_parameter_item.first().line;
+            self.group_begin();
             self.comma(&x.comma);
-            if self.multi_line() {
-                self.newline();
+            if item_user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.with_generic_parameter_item(&x.with_generic_parameter_item);
+            self.group_end();
         }
-        if self.multi_line() {
-            if let Some(ref x) = arg.with_generic_parameter_list_opt {
-                self.comma(&x.comma);
-            } else {
-                self.str(",");
-            }
-        }
+        // Trailing comma in multi-line layout only.
+        self.emit_doc(doc::if_break(","));
     }
 
     /// Semantic action for non-terminal 'WithGenericParameterItem'
@@ -2216,27 +2459,34 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'WithGenericArgument'
     fn with_generic_argument(&mut self, arg: &WithGenericArgument) {
-        let multi_line = arg.with_generic_argument_opt.is_some()
+        let user_broken = arg.with_generic_argument_opt.is_some()
             && arg.colon_colon_l_angle.line() != arg.r_angle.line();
-
-        if multi_line {
+        let items_per_line_broken = user_broken
+            && arg.with_generic_argument_opt.as_ref().is_some_and(|opt| {
+                let list = &opt.with_generic_argument_list;
+                let first_broken =
+                    arg.colon_colon_l_angle.line() != list.with_generic_argument_item.first().line;
+                let rest_broken = list
+                    .with_generic_argument_list_list
+                    .iter()
+                    .all(|x| x.comma.line() != x.with_generic_argument_item.first().line);
+                first_broken && rest_broken
+            });
+        if items_per_line_broken {
             self.multi_line_start();
         }
+        self.group_begin();
         self.colon_colon_l_angle(&arg.colon_colon_l_angle);
-        if self.multi_line() {
-            self.newline_push();
-        }
-
         if let Some(x) = &arg.with_generic_argument_opt {
+            self.group_nest_begin();
+            self.list_outer_break(user_broken);
             self.with_generic_argument_list(&x.with_generic_argument_list);
-        }
-
-        if self.multi_line() {
-            self.newline_pop();
-            self.align_reset();
+            self.group_nest_end();
+            self.list_outer_break(user_broken);
         }
         self.r_angle(&arg.r_angle);
-        if multi_line {
+        self.group_end();
+        if items_per_line_broken {
             self.multi_line_finish();
         }
     }
@@ -2245,21 +2495,18 @@ impl VerylWalker for Formatter {
     fn with_generic_argument_list(&mut self, arg: &WithGenericArgumentList) {
         self.with_generic_argument_item(&arg.with_generic_argument_item);
         for x in &arg.with_generic_argument_list_list {
+            let item_user_broken = x.comma.line() != x.with_generic_argument_item.first().line;
+            self.group_begin();
             self.comma(&x.comma);
-            if self.multi_line() {
-                self.newline();
+            if item_user_broken {
+                self.emit_doc(Doc::UserBreak);
             } else {
-                self.space(1);
+                self.soft_line();
             }
             self.with_generic_argument_item(&x.with_generic_argument_item);
+            self.group_end();
         }
-        if self.multi_line() {
-            if let Some(ref x) = arg.with_generic_argument_list_opt {
-                self.comma(&x.comma);
-            } else {
-                self.str(",");
-            }
-        }
+        self.emit_doc(doc::if_break(","));
     }
 
     /// Semantic action for non-terminal 'WithGenericArgumentItem'
@@ -2938,13 +3185,19 @@ impl VerylWalker for Formatter {
             self.embed_item(&x.embed_item);
         }
         self.keep_tail_newline = false;
-        if !self
-            .string
-            .chars()
-            .last()
-            .map(|c| c.is_ascii_whitespace())
-            .unwrap_or(false)
-        {
+        let last_ws = match self.mode {
+            Mode::Emit => self
+                .last_emitted_char
+                .map(|c| c.is_ascii_whitespace())
+                .unwrap_or(false),
+            _ => self
+                .string
+                .chars()
+                .last()
+                .map(|c| c.is_ascii_whitespace())
+                .unwrap_or(false),
+        };
+        if !last_ws {
             self.newline();
         }
         self.triple_r_brace(&arg.triple_r_brace);

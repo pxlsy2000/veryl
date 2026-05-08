@@ -264,3 +264,204 @@ fn format_generic_list() {
     let ret = format(&metadata, &code);
     assert_eq!(ret, expect);
 }
+
+// ----- Issue #2598: format based on line width -----------------------------
+
+#[test]
+fn max_width_breaks_binary_expression() {
+    // The example from https://github.com/veryl-lang/veryl/issues/2598:
+    // a sum that doesn't fit on one line should wrap with operators at
+    // the head of each continuation line.
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 60;
+
+    let code = r#"module M {
+    let a: logic = aaaaaaaaaaaa + bbbbbbbbbb + cccccccccccc + dddddddddd + eeeeeeeeeeee;
+}
+"#;
+    let expect = r#"module M {
+    let a: logic = aaaaaaaaaaaa + bbbbbbbbbb + cccccccccccc
+        + dddddddddd + eeeeeeeeeeee;
+}
+"#;
+
+    let ret = format(&metadata, code);
+    assert_eq!(ret, expect);
+}
+
+#[test]
+fn max_width_keeps_short_binary_expression_flat() {
+    // A short expression must stay on one line regardless of how many
+    // operands it has.
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 120;
+
+    let code = r#"module M {
+    let a: logic = b + c + d;
+}
+"#;
+    let expect = code;
+
+    let ret = format(&metadata, code);
+    assert_eq!(ret, expect);
+}
+
+#[test]
+fn max_width_breaks_function_call() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 30;
+
+    let code = r#"module M {
+    let _: logic = func(aaaa, bbbb, cccc, dddd);
+}
+"#;
+    let ret = format(&metadata, code);
+    // The call should wrap with each arg on its own line.
+    assert!(
+        ret.contains("\n        aaaa,") && ret.contains("\n    )"),
+        "expected wrapped function call in:\n{ret}"
+    );
+}
+
+#[test]
+fn max_width_user_break_respected() {
+    // The user already laid out the function call on multiple lines.
+    // Width-driven wrapping must not collapse it back onto one line just
+    // because the contents would fit.
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 200;
+
+    let code = r#"module M {
+    let _: logic = func(
+        a,
+        b,
+    );
+}
+"#;
+    let ret = format(&metadata, code);
+    // Even with plenty of width, the multi-line layout from the source
+    // should be preserved.
+    // (We only assert presence of the broken layout here; exact alignment
+    //  may differ slightly until Stage A4 regenerates the testcases.)
+    assert!(
+        ret.contains("\n        a,") || ret.contains("\n        a "),
+        "expected user-broken layout preserved in:\n{ret}"
+    );
+}
+
+#[test]
+fn max_width_breaks_nested_expression() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 40;
+
+    let code = r#"module M {
+    let _: logic = aa + bb + cc + dd + ee;
+}
+"#;
+    let ret = format(&metadata, code);
+    // Should break before some operator to fit max_width=40.
+    assert!(
+        ret.contains("\n        +"),
+        "expected operator wrap in:\n{ret}"
+    );
+}
+
+#[test]
+fn max_width_keeps_short_function_call_flat() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 120;
+
+    let code = r#"module M {
+    let _: logic = f(a, b, c);
+}
+"#;
+    let expect = code;
+
+    let ret = format(&metadata, code);
+    assert_eq!(ret, expect);
+}
+
+#[test]
+fn max_width_breaks_ternary() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 30;
+
+    let code = r#"module M {
+    let _: logic = if a == 1 ? bbbb : cccc;
+}
+"#;
+    let ret = format(&metadata, code);
+    // Long ternary should break at the `?` and `:` boundaries.
+    assert!(
+        ret.contains("?\n") && ret.contains(":\n"),
+        "expected ternary wrap in:\n{ret}"
+    );
+}
+
+#[test]
+fn max_width_keeps_short_ternary_flat() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 120;
+
+    let code = r#"module M {
+    let _: logic = if a ? b : c;
+}
+"#;
+    let expect = code;
+
+    let ret = format(&metadata, code);
+    assert_eq!(ret, expect);
+}
+
+#[test]
+fn max_width_breaks_concatenation() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 30;
+
+    let code = r#"module M {
+    let _: logic<32> = {aaaa, bbbb, cccc, dddd};
+}
+"#;
+    let ret = format(&metadata, code);
+    // The concatenation should wrap when it doesn't fit. Items may be
+    // packed (fill mode) — assert that at least one break happens.
+    assert!(
+        ret.contains("\n        ") && ret.contains("\n    }"),
+        "expected concatenation wrap in:\n{ret}"
+    );
+}
+
+#[test]
+fn max_width_keeps_short_concatenation_flat() {
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 120;
+
+    let code = r#"module M {
+    let _: logic<32> = {a, b, c, d};
+}
+"#;
+    let expect = code;
+
+    let ret = format(&metadata, code);
+    assert_eq!(ret, expect);
+}
+
+#[test]
+fn max_width_breaks_at_continuation_indent() {
+    // Continuation lines indent +1 level past the surrounding statement.
+    // The let statement is at module-indent (4 spaces), so the continuation
+    // sits at 8 spaces.
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.format.max_width = 30;
+
+    let code = r#"module M {
+    let aaaaaaa: logic = xxxx + yyyy + zzzz + wwww;
+}
+"#;
+    let ret = format(&metadata, code);
+    // Verify a break occurred and the continuation is indented.
+    assert!(
+        ret.contains("\n        +"),
+        "expected continuation indent of 8 spaces in:\n{ret}"
+    );
+}

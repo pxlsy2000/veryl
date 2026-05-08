@@ -61,7 +61,10 @@ module Module68D #(
     assign o_d = $std::select::<KIND, N, lbool>(i_select, i_d);
 }
 
-module Module68E::<AXI4_PKG: $std::axi4_prototype, AXI4_LITE_PKG: $std::axi4_lite_prototype, AXI4_STREAM_PKG: $std::axi4_stream_prototype> (
+module Module68E::<
+    AXI4_PKG: $std::axi4_prototype, AXI4_LITE_PKG: $std::axi4_lite_prototype,
+    AXI4_STREAM_PKG: $std::axi4_stream_prototype,
+> (
     axi4_if       : modport $std::axi4_if::<AXI4_PKG>::slave                 ,
     axi4_lite_if  : modport $std::axi4_lite_if::<AXI4_LITE_PKG>::slave       ,
     axi4_stream_if: modport $std::axi4_stream_if::<AXI4_STREAM_PKG>::receiver,
@@ -72,7 +75,9 @@ module Module68E::<AXI4_PKG: $std::axi4_prototype, AXI4_LITE_PKG: $std::axi4_lit
 }
 
 alias package axi_pkg = $std::axi4_pkg::<32, 8, 8, 8, 8, 8, 8, 8>;
-alias package axi_lite_pkg = $std::axi4_lite_pkg::<axi_pkg::ADDRESS_WIDTH, axi_pkg::DATA_WIDTH_BYTES, axi_pkg::ID_LENGTH>;
+alias package axi_lite_pkg = $std::axi4_lite_pkg::<
+    axi_pkg::ADDRESS_WIDTH, axi_pkg::DATA_WIDTH_BYTES, axi_pkg::ID_LENGTH,
+>;
 alias package axi_stream_pkg = $std::axi4_stream_pkg::<axi_pkg::DATA_WIDTH_BYTES, 2, axi_pkg::ID_LENGTH, 5>;
 
 module Module68F {
