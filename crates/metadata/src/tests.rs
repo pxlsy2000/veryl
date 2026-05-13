@@ -39,6 +39,16 @@ sub4   = {path = "../sub4"}
 sub6   = {path = "../sub6"}
 "#;
 
+const MAIN_INNER_TOML: &'static str = r#"
+[project]
+name = "main_inner"
+version = "0.1.0"
+
+[dependencies]
+inner1 = {git = "file://{}/inner", version = "0.1.0"}
+inner2 = {git = "file://{}/inner", version = "0.1.0"}
+"#;
+
 const SUB1_TOML: &'static str = r#"
 [project]
 name = "sub1"
@@ -109,6 +119,18 @@ bump_commit = true
 publish_commit = true
 "#;
 
+const INNER1_TOML: &'static str = r#"
+[project]
+name = "inner1"
+version = "0.1.0"
+"#;
+
+const INNER2_TOML: &'static str = r#"
+[project]
+name = "inner2"
+version = "0.1.0"
+"#;
+
 fn create_metadata_simple() -> (Metadata, TempDir) {
     let tempdir = tempfile::tempdir().unwrap();
     let metadata = create_project(tempdir.path(), "test", TEST_TOML, false);
@@ -125,6 +147,15 @@ fn create_metadata_multi() -> (Metadata, TempDir) {
     create_project(tempdir.path(), "sub4", SUB4_TOML, true);
     create_project(&tempdir.path().join("sub4"), "sub5", SUB5_TOML, true);
     create_project(tempdir.path(), "sub6", SUB6_TOML, true);
+
+    (metadata, tempdir)
+}
+
+fn create_metadata_inner_project() -> (Metadata, TempDir) {
+    let tempdir = tempfile::tempdir().unwrap();
+    let metadata = create_project(tempdir.path(), "main_inner", MAIN_INNER_TOML, false);
+    create_inner_project(tempdir.path(), "inner", "inner1", INNER1_TOML);
+    create_inner_project(tempdir.path(), "inner", "inner2", INNER2_TOML);
 
     (metadata, tempdir)
 }
@@ -161,6 +192,51 @@ fn create_project(root: &Path, name: &str, toml: &str, publish: bool) -> Metadat
         metadata.bump_version(BumpKind::Major).unwrap();
         metadata.publish().unwrap();
     }
+    metadata
+}
+
+fn create_inner_project(root: &Path, repository: &str, name: &str, toml: &str) -> Metadata {
+    unsafe {
+        std::env::set_var("GIT_AUTHOR_NAME", "veryl");
+        std::env::set_var("GIT_AUTHOR_EMAIL", "veryl");
+        std::env::set_var("GIT_COMMITTER_NAME", "veryl");
+        std::env::set_var("GIT_COMMITTER_EMAIL", "veryl");
+    }
+
+    let repository_path = root.join(repository);
+    if !repository_path.exists() {
+        fs::create_dir(&repository_path).unwrap();
+        let git_ignore_path = repository_path.join(".gitignore");
+        fs::write(&git_ignore_path, GIT_IGNORE).unwrap();
+        let git = Git::init(&repository_path).unwrap();
+        git.add(&git_ignore_path).unwrap();
+        git.commit(&"Add .gitignore").unwrap();
+    }
+
+    let git = Git::open(&repository_path).unwrap();
+    let path = repository_path.join(name);
+    fs::create_dir(&path).unwrap();
+    let toml_path = path.join("Veryl.toml");
+    fs::write(
+        &toml_path,
+        &toml.replace("{}", &root.to_string_lossy().replace("\\", "/")),
+    )
+    .unwrap();
+    git.add(&toml_path).unwrap();
+    git.commit(&"Add Veryl.toml").unwrap();
+
+    let revision = git.get_revision().unwrap();
+    let pubfile_path = path.join("Veryl.pub");
+    let pubfile = Pubfile {
+        releases: vec![Release {
+            version: Version::parse("0.1.0").unwrap(),
+            revision,
+        }],
+    };
+    pubfile.save(&pubfile_path).unwrap();
+    let metadata = Metadata::load(&toml_path).unwrap();
+    git.add(&metadata.pubfile_path).unwrap();
+    git.commit(&"Add Veryl.pub").unwrap();
     metadata
 }
 
@@ -355,6 +431,31 @@ fn lockfile() {
     assert_eq!(
         sub3_3.unwrap().source.get_version(),
         Some(&Version::parse("1.0.0").unwrap())
+    );
+
+    let _ = lockfile.clear_cache();
+}
+
+#[test]
+fn lockfile_inner_project() {
+    let (metadata, _tempdir) = create_metadata_inner_project();
+    let lockfile = Lockfile::new(&metadata).unwrap();
+    let tbl = &lockfile.lock_table;
+    let inner1 = tbl
+        .iter()
+        .find_map(|(_, x)| x.iter().find(|x| x.name == "inner1"));
+    let inner2 = tbl
+        .iter()
+        .find_map(|(_, x)| x.iter().find(|x| x.name == "inner2"));
+    assert!(inner1.is_some());
+    assert!(inner2.is_some());
+    assert_eq!(
+        inner1.unwrap().source.get_version(),
+        Some(&Version::parse("0.1.0").unwrap())
+    );
+    assert_eq!(
+        inner2.unwrap().source.get_version(),
+        Some(&Version::parse("0.1.0").unwrap())
     );
 
     let _ = lockfile.clear_cache();
