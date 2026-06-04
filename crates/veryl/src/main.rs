@@ -71,11 +71,16 @@ fn main() -> Result<ExitCode> {
         .apply()
         .into_diagnostic()?;
 
+    if let Commands::External(args) = &opt.command {
+        return external_subcommand::dispatch(args.clone());
+    }
+
     let (mut metadata, dot_build_lock) = match opt.command {
         Commands::New(_) | Commands::Init(_) | Commands::Translate(_) => {
             // dummy metadata
             (Metadata::create_default("dummy").unwrap(), None)
         }
+        Commands::External(_) => unreachable!(),
         _ => {
             let metadata_path = Metadata::search_from_current()?;
             let metadata = Metadata::load(metadata_path)?;
@@ -110,6 +115,7 @@ fn main() -> Result<ExitCode> {
         Commands::Test(x) => cmd_test::CmdTest::new(x).exec(&mut metadata),
         Commands::Synth(x) => cmd_synth::CmdSynth::new(x).exec(&mut metadata),
         Commands::Translate(x) => cmd_translate::CmdTranslate::new(x).exec(),
+        Commands::External(_) => unreachable!(),
     };
 
     if let Some(dot_build_lock) = dot_build_lock {
