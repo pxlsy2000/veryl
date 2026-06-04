@@ -25,6 +25,34 @@ target = {type = "source"}
 indent_width = 4
 "#;
 
+const EXTENSION_VLOOM_TOML: &'static str = r#"
+[project]
+name = "test"
+version = "0.1.0"
+
+[metadata.vloom]
+files = ["src/**/*.v"]
+attrs = { role = "core" }
+"#;
+
+const EXTENSION_OTHER_TOOL_TOML: &'static str = r#"
+[project]
+name = "test"
+version = "0.1.0"
+
+[metadata.other_tool]
+enabled = true
+"#;
+
+const UNKNOWN_TOP_LEVEL_TOML: &'static str = r#"
+[project]
+name = "test"
+version = "0.1.0"
+
+[unknown]
+value = true
+"#;
+
 const MAIN_TOML: &'static str = r#"
 [project]
 name = "main"
@@ -256,6 +284,170 @@ fn check_toml() {
     assert!(metadata.build.reset_low_prefix.is_none());
     assert_eq!(metadata.build.reset_low_suffix.unwrap(), "_n");
     assert_eq!(metadata.format.indent_width, 4);
+}
+
+#[test]
+fn load_extension_namespace_metadata() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let toml_path = tempdir.path().join("Veryl.toml");
+    fs::write(&toml_path, EXTENSION_VLOOM_TOML).unwrap();
+
+    let metadata = Metadata::load(&toml_path).unwrap();
+    let vloom = metadata.metadata.get("vloom").unwrap().as_table().unwrap();
+
+    assert_eq!(
+        vloom.get("files").unwrap().as_array().unwrap()[0]
+            .as_str()
+            .unwrap(),
+        "src/**/*.v"
+    );
+    assert_eq!(
+        vloom
+            .get("attrs")
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .get("role")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "core"
+    );
+}
+
+#[test]
+fn load_extension_namespace_other_tool() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let toml_path = tempdir.path().join("Veryl.toml");
+    fs::write(&toml_path, EXTENSION_OTHER_TOOL_TOML).unwrap();
+
+    let metadata = Metadata::load(&toml_path).unwrap();
+
+    assert!(metadata.metadata.contains_key("other_tool"));
+    assert_eq!(
+        metadata
+            .metadata
+            .get("other_tool")
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .get("enabled")
+            .unwrap()
+            .as_bool()
+            .unwrap(),
+        true
+    );
+}
+
+#[test]
+fn reject_unknown_top_level_table() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let toml_path = tempdir.path().join("Veryl.toml");
+    fs::write(&toml_path, UNKNOWN_TOP_LEVEL_TOML).unwrap();
+
+    assert!(Metadata::load(&toml_path).is_err());
+}
+
+#[test]
+fn metadata_output_v1_simple_project() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let metadata = create_project(tempdir.path(), "test", EXTENSION_VLOOM_TOML, false);
+
+    let output = MetadataOutputV1::from_metadata(&metadata);
+    let encoded = serde_json::to_string(&output).unwrap();
+    let value = serde_json::to_value(&output).unwrap();
+
+    assert_eq!(output.format_version, 1);
+    assert_eq!(value["format_version"], 1);
+    assert_eq!(output.root.name, "test");
+    assert_eq!(output.root.version, Some(Version::parse("0.1.0").unwrap()));
+    assert_eq!(output.root.local_path, tempdir.path().join("test"));
+    assert!(output.dependencies.is_empty());
+    assert_eq!(value["root"]["name"], "test");
+    assert_eq!(
+        value["root"]["local_path"].as_str().unwrap(),
+        tempdir.path().join("test").to_string_lossy().as_ref()
+    );
+    assert_eq!(value["metadata"]["vloom"]["attrs"]["role"], "core");
+    assert_eq!(
+        output
+            .metadata
+            .get("vloom")
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .get("attrs")
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .get("role")
+            .unwrap()
+            .as_str()
+            .unwrap(),
+        "core"
+    );
+    assert!(!encoded.contains("metadata_path"));
+    assert!(!encoded.contains("lockfile_path"));
+    assert!(!encoded.contains("pubfile_path"));
+    assert!(!encoded.contains("build_info"));
+}
+
+#[test]
+fn metadata_output_v1_multi_dependency_deterministic() {
+    let (mut metadata, _tempdir) = create_metadata_multi();
+    metadata.update_lockfile().unwrap();
+
+    let output = MetadataOutputV1::from_metadata(&metadata);
+    let repeated = MetadataOutputV1::from_metadata(&metadata);
+    let encoded = serde_json::to_string(&output).unwrap();
+    let repeated_encoded = serde_json::to_string(&repeated).unwrap();
+    let value = serde_json::to_value(&output).unwrap();
+    let ids = output
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(encoded, repeated_encoded);
+    assert_eq!(value["format_version"], 1);
+    assert!(!output.dependencies.is_empty());
+    assert!(ids.windows(2).all(|window| window[0] <= window[1]));
+    assert!(ids.contains(&"dep:sub1"));
+    assert!(ids.contains(&"dep:sub2"));
+    assert!(ids.contains(&"dep:sub2_0"));
+    assert!(output.dependencies.iter().any(|dependency| {
+        dependency.id == "dep:sub1" && dependency.dependencies.contains(&"dep:sub2_0".to_string())
+    }));
+    assert!(output.dependencies.iter().any(|dependency| {
+        matches!(dependency.source, MetadataSourceV1::Repository { .. })
+            && !dependency.local_path.as_os_str().is_empty()
+    }));
+    assert!(output.dependencies.iter().any(|dependency| {
+        matches!(dependency.source, MetadataSourceV1::Path { .. })
+            && !dependency.local_path.as_os_str().is_empty()
+    }));
+    assert!(
+        output
+            .dependencies
+            .iter()
+            .all(|dependency| !dependency.local_path.as_os_str().is_empty())
+    );
+    assert!(
+        value["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|dependency| {
+                dependency
+                    .get("local_path")
+                    .and_then(|local_path| local_path.as_str())
+                    .is_some_and(|local_path| !local_path.is_empty())
+            })
+    );
+    assert!(!encoded.contains("metadata_path"));
+    assert!(!encoded.contains("lockfile_path"));
+    assert!(!encoded.contains("pubfile_path"));
+    assert!(!encoded.contains("build_info"));
 }
 
 #[test]
