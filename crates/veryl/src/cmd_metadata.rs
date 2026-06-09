@@ -11,7 +11,7 @@ impl CmdMetadata {
         Self { opt }
     }
 
-    pub fn exec(&self, metadata: &Metadata) -> Result<bool> {
+    pub fn exec(&self, metadata: &mut Metadata) -> Result<bool> {
         let text = self.format_metadata(metadata)?;
 
         println!("{text}");
@@ -19,13 +19,14 @@ impl CmdMetadata {
         Ok(true)
     }
 
-    fn format_metadata(&self, metadata: &Metadata) -> Result<String> {
+    fn format_metadata(&self, metadata: &mut Metadata) -> Result<String> {
         match (self.opt.format, self.opt.format_version) {
             (Format::Json, None) => serde_json::to_string(metadata).into_diagnostic(),
             (Format::Pretty, None) => Ok(format!("{metadata:#?}")),
             (Format::Json, Some(1)) => serde_json::to_string(metadata).into_diagnostic(),
             (Format::Json, Some(2)) => {
-                let output = MetadataOutputV2::from_metadata(metadata);
+                metadata.update_lockfile()?;
+                let output = MetadataOutputV2::from_metadata(metadata)?;
                 serde_json::to_string(&output).into_diagnostic()
             }
             (Format::Pretty, Some(_)) => {
@@ -62,6 +63,40 @@ files = ["src/**/*.v"]
         (metadata, tempdir)
     }
 
+    fn load_metadata_with_path_dependency() -> (Metadata, tempfile::TempDir) {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root_dir = tempdir.path().join("root");
+        let dependency_dir = tempdir.path().join("dep");
+        fs::create_dir(&root_dir).unwrap();
+        fs::create_dir(&dependency_dir).unwrap();
+        fs::write(
+            root_dir.join("Veryl.toml"),
+            r#"
+[project]
+name = "root"
+version = "0.1.0"
+
+[dependencies]
+dep = {path = "../dep"}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dependency_dir.join("Veryl.toml"),
+            r#"
+[project]
+name = "real_dep"
+version = "0.1.0"
+
+[metadata.vloom]
+role = "dependency"
+"#,
+        )
+        .unwrap();
+        let metadata = Metadata::load(root_dir.join("Veryl.toml")).unwrap();
+        (metadata, tempdir)
+    }
+
     fn command(format: Format, format_version: Option<u32>) -> CmdMetadata {
         CmdMetadata::new(OptMetadata {
             format,
@@ -72,14 +107,14 @@ files = ["src/**/*.v"]
     #[test]
     fn json_format_version_1_preserves_internal_metadata_shape() {
         // Given: project metadata with extension-owned metadata.
-        let (metadata, _tempdir) = load_metadata();
+        let (mut metadata, _tempdir) = load_metadata();
 
         // When: JSON metadata is formatted with legacy format version 1.
         let versioned_text = command(Format::Json, Some(1))
-            .format_metadata(&metadata)
+            .format_metadata(&mut metadata)
             .unwrap();
         let unversioned_text = command(Format::Json, None)
-            .format_metadata(&metadata)
+            .format_metadata(&mut metadata)
             .unwrap();
         let versioned_value: serde_json::Value = serde_json::from_str(&versioned_text).unwrap();
         let unversioned_value: serde_json::Value = serde_json::from_str(&unversioned_text).unwrap();
@@ -98,10 +133,10 @@ files = ["src/**/*.v"]
     #[test]
     fn json_format_version_2_emits_stable_graph_metadata_shape() {
         // Given: project metadata with extension-owned metadata.
-        let (metadata, _tempdir) = load_metadata();
+        let (mut metadata, _tempdir) = load_metadata();
 
         // When: JSON metadata is formatted with stable graph format version 2.
-        let text = command(Format::Json, Some(2)).format_metadata(&metadata);
+        let text = command(Format::Json, Some(2)).format_metadata(&mut metadata);
 
         // Then: version 2 uses the stable graph metadata contract.
         assert!(
@@ -112,19 +147,20 @@ files = ["src/**/*.v"]
         let value: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
         assert_eq!(value["format_version"], 2);
         assert_eq!(value["root"]["name"], "test");
+        assert_eq!(value["root"]["metadata"]["vloom"]["files"][0], "src/**/*.v");
         assert!(value["dependencies"].as_array().unwrap().is_empty());
-        assert_eq!(value["metadata"]["vloom"]["files"][0], "src/**/*.v");
+        assert!(value.get("metadata").is_none());
         assert!(value.get("project").is_none());
     }
 
     #[test]
     fn unversioned_json_preserves_internal_metadata_shape() {
         // Given: project metadata with extension-owned metadata.
-        let (metadata, _tempdir) = load_metadata();
+        let (mut metadata, _tempdir) = load_metadata();
 
         // When: JSON metadata is formatted without an explicit version.
         let text = command(Format::Json, None)
-            .format_metadata(&metadata)
+            .format_metadata(&mut metadata)
             .unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
 
@@ -137,12 +173,12 @@ files = ["src/**/*.v"]
     #[test]
     fn pretty_format_version_is_rejected() {
         // Given: project metadata and pretty output with explicit format versions.
-        let (metadata, _tempdir) = load_metadata();
+        let (mut metadata, _tempdir) = load_metadata();
 
         for version in [1, 2] {
             // When: pretty metadata is formatted with an explicit version.
             let error = command(Format::Pretty, Some(version))
-                .format_metadata(&metadata)
+                .format_metadata(&mut metadata)
                 .unwrap_err();
 
             // Then: pretty format rejects every explicit version.
@@ -157,15 +193,76 @@ files = ["src/**/*.v"]
     #[test]
     fn unsupported_format_version_is_rejected() {
         // Given: project metadata.
-        let (metadata, _tempdir) = load_metadata();
+        let (mut metadata, _tempdir) = load_metadata();
 
         // When: JSON metadata is formatted with an unsupported version.
         let error = command(Format::Json, Some(3))
-            .format_metadata(&metadata)
+            .format_metadata(&mut metadata)
             .unwrap_err();
 
         // Then: the error reports all supported versions.
         assert!(error.to_string().contains("unsupported --format-version 3"));
         assert!(error.to_string().contains("supported versions: 1, 2"));
+    }
+
+    #[test]
+    fn json_format_version_2_resolves_missing_lockfile() {
+        // Given: project metadata with a path dependency and no existing lockfile.
+        let (mut metadata, _tempdir) = load_metadata_with_path_dependency();
+        assert!(!metadata.lockfile_path.exists());
+
+        // When: JSON metadata is formatted with stable graph format version 2.
+        let text = command(Format::Json, Some(2))
+            .format_metadata(&mut metadata)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        // Then: version 2 creates the lockfile and emits resolved dependencies.
+        assert!(metadata.lockfile_path.exists());
+        assert_eq!(value["format_version"], 2);
+        assert_eq!(value["root"]["metadata"], serde_json::json!({}));
+        assert_eq!(value["dependencies"][0]["name"], "dep");
+        assert_eq!(value["dependencies"][0]["project"], "real_dep");
+        assert_eq!(value["dependencies"][0]["source"]["kind"], "path");
+        assert!(
+            value["dependencies"][0]["local_path"]
+                .as_str()
+                .unwrap()
+                .starts_with('/')
+        );
+        assert_eq!(
+            value["dependencies"][0]["metadata"]["vloom"]["role"],
+            "dependency"
+        );
+    }
+
+    #[test]
+    fn legacy_json_does_not_resolve_missing_lockfile() {
+        // Given: project metadata with a path dependency and no existing lockfile.
+        let (mut metadata, _tempdir) = load_metadata_with_path_dependency();
+        assert!(!metadata.lockfile_path.exists());
+
+        // When: legacy JSON metadata is formatted.
+        let _text = command(Format::Json, Some(1))
+            .format_metadata(&mut metadata)
+            .unwrap();
+
+        // Then: legacy JSON keeps the existing debug behavior and does not create a lockfile.
+        assert!(!metadata.lockfile_path.exists());
+    }
+
+    #[test]
+    fn unversioned_json_does_not_resolve_missing_lockfile() {
+        // Given: project metadata with a path dependency and no existing lockfile.
+        let (mut metadata, _tempdir) = load_metadata_with_path_dependency();
+        assert!(!metadata.lockfile_path.exists());
+
+        // When: unversioned JSON metadata is formatted.
+        let _text = command(Format::Json, None)
+            .format_metadata(&mut metadata)
+            .unwrap();
+
+        // Then: unversioned JSON keeps the existing debug behavior and does not create a lockfile.
+        assert!(!metadata.lockfile_path.exists());
     }
 }

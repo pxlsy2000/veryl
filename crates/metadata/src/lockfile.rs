@@ -642,7 +642,7 @@ impl Lockfile {
         Ok(dependencies_dir.join(uuid.simple().encode_lower(&mut Uuid::encode_buffer())))
     }
 
-    fn get_metadata(&self, source: &LockSource) -> Result<Metadata, MetadataError> {
+    pub(crate) fn get_metadata(&self, source: &LockSource) -> Result<Metadata, MetadataError> {
         // try to load from local path
         let path = match source {
             LockSource::Path(x) => Some(x.clone()),
