@@ -26,7 +26,7 @@ pub use lockfile::{LockSource, Lockfile};
 pub use metadata::{BumpKind, Metadata, UrlPath};
 pub use metadata_error::MetadataError;
 pub use metadata_output::{
-    MetadataDependencyV1, MetadataOutputV1, MetadataProjectV1, MetadataSourceV1,
+    MetadataDependencyV2, MetadataOutputV2, MetadataProjectV2, MetadataSourceV2,
 };
 pub use project::Project;
 pub use pubfile::{Pubfile, Release};

@@ -6,33 +6,33 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct MetadataOutputV1 {
+pub struct MetadataOutputV2 {
     pub format_version: usize,
-    pub root: MetadataProjectV1,
-    pub dependencies: Vec<MetadataDependencyV1>,
+    pub root: MetadataProjectV2,
+    pub dependencies: Vec<MetadataDependencyV2>,
     pub metadata: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct MetadataProjectV1 {
+pub struct MetadataProjectV2 {
     pub name: String,
     pub version: Option<Version>,
     pub local_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
-pub struct MetadataDependencyV1 {
+pub struct MetadataDependencyV2 {
     pub id: String,
     pub name: String,
     pub project: String,
-    pub source: MetadataSourceV1,
+    pub source: MetadataSourceV2,
     pub local_path: PathBuf,
     pub dependencies: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MetadataSourceV1 {
+pub enum MetadataSourceV2 {
     Path {
         path: PathBuf,
     },
@@ -45,7 +45,7 @@ pub enum MetadataSourceV1 {
     },
 }
 
-impl MetadataOutputV1 {
+impl MetadataOutputV2 {
     pub fn from_metadata(metadata: &Metadata) -> Self {
         let project_path = metadata.project_path();
         let locks = metadata.lockfile.projects();
@@ -55,13 +55,13 @@ impl MetadataOutputV1 {
             .collect::<HashMap<_, _>>();
         let mut dependencies = locks
             .iter()
-            .map(|lock| MetadataDependencyV1::from_lock(lock, &project_path, &dependency_ids))
+            .map(|lock| MetadataDependencyV2::from_lock(lock, &project_path, &dependency_ids))
             .collect::<Vec<_>>();
         dependencies.sort_by(|x, y| x.id.cmp(&y.id));
 
         Self {
-            format_version: 1,
-            root: MetadataProjectV1 {
+            format_version: 2,
+            root: MetadataProjectV2 {
                 name: metadata.project.name.clone(),
                 version: metadata.project.version.clone(),
                 local_path: project_path,
@@ -72,13 +72,13 @@ impl MetadataOutputV1 {
     }
 }
 
-impl MetadataDependencyV1 {
+impl MetadataDependencyV2 {
     fn from_lock(
         lock: &Lock,
         root_path: &Path,
         dependency_ids: &HashMap<LockSource, String>,
     ) -> Self {
-        let source = MetadataSourceV1::from_lock_source(&lock.source);
+        let source = MetadataSourceV2::from_lock_source(&lock.source);
         let mut dependencies = lock
             .dependencies
             .iter()
@@ -106,7 +106,7 @@ impl MetadataDependencyV1 {
     }
 }
 
-impl MetadataSourceV1 {
+impl MetadataSourceV2 {
     fn from_lock_source(source: &LockSource) -> Self {
         match source {
             LockSource::Path(path) => Self::Path { path: path.clone() },

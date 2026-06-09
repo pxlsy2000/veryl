@@ -349,16 +349,16 @@ fn reject_unknown_top_level_table() {
 }
 
 #[test]
-fn metadata_output_v1_simple_project() {
+fn metadata_output_v2_simple_project() {
     let tempdir = tempfile::tempdir().unwrap();
     let metadata = create_project(tempdir.path(), "test", EXTENSION_VLOOM_TOML, false);
 
-    let output = MetadataOutputV1::from_metadata(&metadata);
+    let output = MetadataOutputV2::from_metadata(&metadata);
     let encoded = serde_json::to_string(&output).unwrap();
     let value = serde_json::to_value(&output).unwrap();
 
-    assert_eq!(output.format_version, 1);
-    assert_eq!(value["format_version"], 1);
+    assert_eq!(output.format_version, 2);
+    assert_eq!(value["format_version"], 2);
     assert_eq!(output.root.name, "test");
     assert_eq!(output.root.version, Some(Version::parse("0.1.0").unwrap()));
     assert_eq!(output.root.local_path, tempdir.path().join("test"));
@@ -393,12 +393,12 @@ fn metadata_output_v1_simple_project() {
 }
 
 #[test]
-fn metadata_output_v1_multi_dependency_deterministic() {
+fn metadata_output_v2_multi_dependency_deterministic() {
     let (mut metadata, _tempdir) = create_metadata_multi();
     metadata.update_lockfile().unwrap();
 
-    let output = MetadataOutputV1::from_metadata(&metadata);
-    let repeated = MetadataOutputV1::from_metadata(&metadata);
+    let output = MetadataOutputV2::from_metadata(&metadata);
+    let repeated = MetadataOutputV2::from_metadata(&metadata);
     let encoded = serde_json::to_string(&output).unwrap();
     let repeated_encoded = serde_json::to_string(&repeated).unwrap();
     let value = serde_json::to_value(&output).unwrap();
@@ -409,7 +409,7 @@ fn metadata_output_v1_multi_dependency_deterministic() {
         .collect::<Vec<_>>();
 
     assert_eq!(encoded, repeated_encoded);
-    assert_eq!(value["format_version"], 1);
+    assert_eq!(value["format_version"], 2);
     assert!(!output.dependencies.is_empty());
     assert!(ids.windows(2).all(|window| window[0] <= window[1]));
     assert!(ids.contains(&"dep:sub1"));
@@ -419,11 +419,11 @@ fn metadata_output_v1_multi_dependency_deterministic() {
         dependency.id == "dep:sub1" && dependency.dependencies.contains(&"dep:sub2_0".to_string())
     }));
     assert!(output.dependencies.iter().any(|dependency| {
-        matches!(dependency.source, MetadataSourceV1::Repository { .. })
+        matches!(dependency.source, MetadataSourceV2::Repository { .. })
             && !dependency.local_path.as_os_str().is_empty()
     }));
     assert!(output.dependencies.iter().any(|dependency| {
-        matches!(dependency.source, MetadataSourceV1::Path { .. })
+        matches!(dependency.source, MetadataSourceV2::Path { .. })
             && !dependency.local_path.as_os_str().is_empty()
     }));
     assert!(
