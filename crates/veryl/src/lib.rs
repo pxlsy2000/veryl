@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 pub mod cmd_build;
@@ -19,6 +20,7 @@ pub mod cmd_update;
 pub mod context;
 pub mod diff;
 pub mod doc;
+pub mod external_subcommand;
 pub mod runner;
 pub mod stopwatch;
 pub mod utils;
@@ -81,6 +83,8 @@ pub enum Commands {
     Test(OptTest),
     Synth(OptSynth),
     Translate(OptTranslate),
+    #[command(external_subcommand)]
+    External(Vec<OsString>),
 }
 
 /// Translate SystemVerilog files into Veryl source
