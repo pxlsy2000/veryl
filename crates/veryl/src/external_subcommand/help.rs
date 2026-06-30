@@ -192,6 +192,7 @@ mod tests {
         write_executable(dir.path(), OsStr::new("veryl-flist"));
         write_executable(dir.path(), OsStr::new("veryl-"));
         write_executable(dir.path(), OsStr::new("veryl-bad\\name"));
+        #[cfg(not(target_os = "macos"))]
         write_executable(dir.path(), OsStr::from_bytes(b"veryl-im\xffort"));
         write_non_executable(dir.path(), OsStr::new("veryl-import"));
 
