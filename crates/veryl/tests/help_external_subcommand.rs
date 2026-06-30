@@ -5,10 +5,12 @@
 mod invalid_sidecar;
 
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
+
+#[cfg(not(target_os = "macos"))]
+use std::os::unix::ffi::OsStringExt;
 
 fn veryl() -> Command {
     Command::new(env!("CARGO_BIN_EXE_veryl"))
@@ -275,6 +277,7 @@ fn root_help_ignores_builtin_collisions() {
 }
 
 #[test]
+#[cfg(not(target_os = "macos"))]
 fn root_help_ignores_non_utf8_external_suffixes() {
     // Given: PATH contains a valid external command and a veryl-prefixed executable with a non-UTF-8 suffix.
     let temp = tempdir();
