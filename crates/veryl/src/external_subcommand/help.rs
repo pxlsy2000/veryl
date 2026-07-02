@@ -1,41 +1,93 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use super::is_executable_file;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
-const MAX_HELP_DESCRIPTION_CHARS: usize = 160;
-const MAX_HELP_SIDECAR_BYTES: u64 = 4096;
+use clap::Command as ClapCommand;
+use miette::{IntoDiagnostic, Result};
 
-pub struct ExternalHelpSubcommand {
-    pub name: String,
-    pub binary_name: String,
-    pub executable_path: PathBuf,
-    pub description: Option<String>,
+use super::{is_executable_file, is_official_non_subcommand_suffix};
+
+const MAX_INFO_DESCRIPTION_CHARS: usize = 160;
+const MAX_INFO_DESCRIPTION_BYTES: usize = MAX_INFO_DESCRIPTION_CHARS * 4 + 2;
+const INFO_TIMEOUT: Duration = Duration::from_millis(500);
+const INFO_KILL_GRACE: Duration = Duration::from_millis(200);
+const EXTERNAL_FALLBACK_DESCRIPTION: &str = "External Veryl subcommand from PATH";
+const HELP_DESCRIPTION: &str = "Print this message or the help of the given subcommand(s)";
+
+enum CommandInfo {
+    BuiltIn { description: String },
+    External { binary_name: String, path: PathBuf },
 }
 
-pub fn discover_help_subcommands(builtins: &[&str]) -> Vec<ExternalHelpSubcommand> {
+pub fn print_command_list(command: ClapCommand) -> Result<()> {
+    let list = render_command_list(command);
+    std::io::stdout()
+        .write_all(list.as_bytes())
+        .into_diagnostic()?;
+    Ok(())
+}
+
+fn render_command_list(command: ClapCommand) -> String {
+    let mut commands = discover_external_commands();
+    insert_builtin_commands(&mut commands, command);
+    commands.insert(
+        "help".to_owned(),
+        CommandInfo::BuiltIn {
+            description: HELP_DESCRIPTION.to_owned(),
+        },
+    );
+
+    let mut output = String::from("Available Commands:\n");
+    for (name, info) in commands {
+        let description = match info {
+            CommandInfo::BuiltIn { description } => description,
+            CommandInfo::External { binary_name, path } => probe_info_description(&path)
+                .unwrap_or_else(|| format!("{EXTERNAL_FALLBACK_DESCRIPTION} ({binary_name})")),
+        };
+        output.push_str(&format!("  {name:<12} {description}\n"));
+    }
+    output
+}
+
+fn insert_builtin_commands(commands: &mut BTreeMap<String, CommandInfo>, command: ClapCommand) {
+    for subcommand in command.get_subcommands() {
+        if subcommand.is_hide_set() {
+            continue;
+        }
+
+        commands.insert(
+            subcommand.get_name().to_owned(),
+            CommandInfo::BuiltIn {
+                description: subcommand
+                    .get_about()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            },
+        );
+    }
+}
+
+fn discover_external_commands() -> BTreeMap<String, CommandInfo> {
     let Some(path) = std::env::var_os("PATH") else {
-        return Vec::new();
+        return BTreeMap::new();
     };
 
-    discover_from_path_entries_excluding(std::env::split_paths(&path), builtins.iter().copied())
+    discover_from_path_entries(std::env::split_paths(&path))
 }
 
-fn discover_from_path_entries_excluding<P, B>(
+fn discover_from_path_entries<P>(
     path_entries: impl IntoIterator<Item = P>,
-    builtins: impl IntoIterator<Item = B>,
-) -> Vec<ExternalHelpSubcommand>
+) -> BTreeMap<String, CommandInfo>
 where
     P: AsRef<Path>,
-    B: AsRef<str>,
 {
-    let mut excluded = builtins
-        .into_iter()
-        .map(|builtin| builtin.as_ref().to_owned())
-        .collect::<BTreeSet<_>>();
-    excluded.insert("help".to_owned());
-
     let mut discovered = BTreeMap::new();
     for dir in path_entries {
         let Ok(entries) = fs::read_dir(dir.as_ref()) else {
@@ -55,184 +107,167 @@ where
             let Some(suffix) = file_name.strip_prefix("veryl-") else {
                 continue;
             };
-            if !suffix.is_empty()
-                && !suffix.contains('/')
-                && !suffix.contains('\\')
-                && !suffix.contains(std::path::MAIN_SEPARATOR)
-                && !excluded.contains(suffix)
-            {
+            if valid_external_suffix(suffix) {
                 discovered
                     .entry(suffix.to_owned())
-                    .or_insert_with(|| ExternalHelpSubcommand {
-                        name: suffix.to_owned(),
+                    .or_insert_with(|| CommandInfo::External {
                         binary_name: file_name.to_owned(),
-                        executable_path: path.clone(),
-                        description: read_help_description(file_name, &path),
+                        path: path.clone(),
                     });
             }
         }
     }
 
-    discovered.into_values().collect()
+    discovered
 }
 
-fn read_help_description(binary_name: &str, executable_path: &Path) -> Option<String> {
-    let sidecar_path = executable_path.with_file_name(format!("{binary_name}.help.toml"));
-    let metadata = fs::metadata(&sidecar_path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_HELP_SIDECAR_BYTES {
-        return None;
-    }
-
-    let content = fs::read_to_string(sidecar_path).ok()?;
-    let document = content.parse::<toml::Table>().ok()?;
-    let description = document.get("description")?.as_str()?;
-    parse_help_description(description)
+fn valid_external_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && !suffix.contains('/')
+        && !suffix.contains('\\')
+        && !suffix.contains(std::path::MAIN_SEPARATOR)
+        && !is_official_non_subcommand_suffix(suffix)
 }
 
-fn parse_help_description(description: &str) -> Option<String> {
-    if description.chars().any(char::is_control) {
+fn probe_info_description(path: &Path) -> Option<String> {
+    let mut command = ProcessCommand::new(path);
+    command
+        .arg("--info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    configure_info_probe_command(&mut command);
+
+    let mut child = command.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let limit = u64::try_from(MAX_INFO_DESCRIPTION_BYTES + 1).unwrap_or(u64::MAX);
+        let stdout = match stdout.take(limit).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() <= MAX_INFO_DESCRIPTION_BYTES => String::from_utf8(bytes).ok(),
+            Ok(_) | Err(_) => None,
+        };
+        let _ = stdout_tx.send(stdout);
+    });
+
+    let started = Instant::now();
+    let mut child_exited_successfully = false;
+    let mut stdout = None;
+    loop {
+        if stdout.is_none() {
+            match stdout_rx.try_recv() {
+                Ok(Some(output)) => stdout = Some(output),
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                    terminate_info_probe(&mut child);
+                    return None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        if child_exited_successfully {
+            if let Some(stdout) = stdout {
+                return parse_info_description(&stdout);
+            }
+        }
+
+        if !child_exited_successfully {
+            let Some(status) = child.try_wait().ok()? else {
+                if started.elapsed() >= INFO_TIMEOUT {
+                    terminate_info_probe(&mut child);
+                    return None;
+                }
+
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+
+            if !status.success() {
+                terminate_info_probe(&mut child);
+                return None;
+            }
+
+            child_exited_successfully = true;
+        }
+
+        if started.elapsed() >= INFO_TIMEOUT {
+            terminate_info_probe(&mut child);
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn configure_info_probe_command(command: &mut ProcessCommand) {
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+}
+
+fn terminate_info_probe(child: &mut Child) {
+    #[cfg(unix)]
+    terminate_info_probe_group(child);
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn terminate_info_probe_group(child: &mut Child) {
+    let process_group = child.id();
+    if let Ok(process_group) = i32::try_from(process_group) {
+        kill_process_group(process_group, libc::SIGKILL);
+        let _ = child.wait();
+
+        let started = Instant::now();
+        while process_group_exists(process_group) && started.elapsed() < INFO_KILL_GRACE {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    } else {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group: i32, signal: i32) {
+    // SAFETY: Category 8 - FFI boundary. libc::kill is called with a negative
+    // process-group id created by CommandExt::process_group(0) for this probe.
+    // The call does not pass Rust references or memory across the FFI boundary.
+    unsafe {
+        libc::kill(-process_group, signal);
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: i32) -> bool {
+    // SAFETY: Category 8 - FFI boundary. Signal 0 performs only an OS existence
+    // check for the process group id; no Rust memory or aliasing invariants cross
+    // the FFI boundary.
+    unsafe { libc::kill(-process_group, 0) == 0 }
+}
+
+fn parse_info_description(stdout: &str) -> Option<String> {
+    let line = stdout
+        .strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
+
+    if line.contains('\n') || line.contains('\r') || line.chars().any(char::is_control) {
         return None;
     }
 
-    let description = description.trim();
-    if description.is_empty() || description.chars().count() > MAX_HELP_DESCRIPTION_CHARS {
+    let line = line.trim();
+    if line.is_empty() || line.chars().count() > MAX_INFO_DESCRIPTION_CHARS {
         return None;
     }
 
-    Some(description.to_owned())
+    Some(line.to_owned())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::OsStr;
-
-    #[cfg(unix)]
-    use std::os::unix::ffi::OsStrExt;
-
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-
-    #[cfg(unix)]
-    fn write_file(dir: &Path, name: &OsStr, mode: u32) {
-        let path = dir.join(Path::new(name));
-        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(mode);
-        fs::set_permissions(path, permissions).unwrap();
-    }
-
-    #[cfg(unix)]
-    fn write_executable(dir: &Path, name: &OsStr) {
-        write_file(dir, name, 0o755);
-    }
-
-    #[cfg(unix)]
-    fn write_non_executable(dir: &Path, name: &OsStr) {
-        write_file(dir, name, 0o644);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn discover_subcommands_keeps_valid_utf8_executable_suffixes_sorted() {
-        // Given: duplicate valid external subcommands exist across PATH entries.
-        let first = tempfile::tempdir().unwrap();
-        let second = tempfile::tempdir().unwrap();
-        write_executable(first.path(), OsStr::new("veryl-import"));
-        write_executable(second.path(), OsStr::new("veryl-import"));
-        write_executable(second.path(), OsStr::new("veryl-flist"));
-        fs::write(
-            first.path().join("veryl-import.help.toml"),
-            "description = \"First import description\"\n",
-        )
-        .unwrap();
-        fs::write(
-            second.path().join("veryl-import.help.toml"),
-            "description = \"Second import description\"\n",
-        )
-        .unwrap();
-
-        // When: discovery scans those PATH entries.
-        let discovered = discover_from_path_entries_excluding(
-            [first.path(), second.path()],
-            std::iter::empty::<&str>(),
-        );
-
-        // Then: names are deduped and sorted by Rust String ordering.
-        assert_eq!(names(&discovered), ["flist", "import"]);
-        assert_eq!(
-            discovered[1].description.as_deref(),
-            Some("First import description")
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn discover_subcommands_ignores_builtin_collisions_and_help() {
-        // Given: PATH contains valid external binaries and names reserved by Veryl.
-        let dir = tempfile::tempdir().unwrap();
-        write_executable(dir.path(), OsStr::new("veryl-build"));
-        write_executable(dir.path(), OsStr::new("veryl-check"));
-        write_executable(dir.path(), OsStr::new("veryl-help"));
-        write_executable(dir.path(), OsStr::new("veryl-import"));
-
-        // When: discovery scans with the built-in command exclusion list.
-        let discovered = discover_from_path_entries_excluding([dir.path()], ["build", "check"]);
-
-        // Then: reserved names are omitted and external-only names remain.
-        assert_eq!(names(&discovered), ["import"]);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn discover_subcommands_ignores_non_executable_non_directory_and_malformed_entries() {
-        // Given: PATH includes malformed candidates, a plain file entry, and one valid command.
-        let dir = tempfile::tempdir().unwrap();
-        let plain_file = tempfile::NamedTempFile::new().unwrap();
-        write_executable(dir.path(), OsStr::new("veryl-flist"));
-        write_executable(dir.path(), OsStr::new("veryl-"));
-        write_executable(dir.path(), OsStr::new("veryl-bad\\name"));
-        #[cfg(not(target_os = "macos"))]
-        write_executable(dir.path(), OsStr::from_bytes(b"veryl-im\xffort"));
-        write_non_executable(dir.path(), OsStr::new("veryl-import"));
-
-        // When: discovery scans all entries.
-        let discovered =
-            discover_from_path_entries_excluding([dir.path(), plain_file.path()], ["flist"]);
-
-        // Then: only valid executable, non-colliding suffixes survive.
-        assert!(discovered.is_empty());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn discover_subcommands_ignores_unreadable_path_entries() {
-        // Given: PATH includes an unreadable directory before a readable external command directory.
-        let unreadable = tempfile::tempdir().unwrap();
-        let readable = tempfile::tempdir().unwrap();
-        let mut permissions = fs::metadata(unreadable.path()).unwrap().permissions();
-        permissions.set_mode(0o000);
-        fs::set_permissions(unreadable.path(), permissions).unwrap();
-        write_executable(readable.path(), OsStr::new("veryl-import"));
-
-        // When: discovery scans all entries.
-        let discovered = discover_from_path_entries_excluding(
-            [unreadable.path(), readable.path()],
-            std::iter::empty::<&str>(),
-        );
-
-        let mut permissions = fs::metadata(unreadable.path()).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(unreadable.path(), permissions).unwrap();
-
-        // Then: unreadable PATH entries do not fail discovery.
-        assert_eq!(names(&discovered), ["import"]);
-    }
-
-    fn names(discovered: &[ExternalHelpSubcommand]) -> Vec<&str> {
-        discovered
-            .iter()
-            .map(|subcommand| subcommand.name.as_str())
-            .collect()
-    }
-}
+mod tests;

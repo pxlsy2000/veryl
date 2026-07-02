@@ -1,11 +1,17 @@
 mod help;
 
-pub use help::{ExternalHelpSubcommand, discover_help_subcommands};
+pub use help::print_command_list;
 
 use miette::{IntoDiagnostic, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+
+pub(crate) const OFFICIAL_NON_SUBCOMMAND_SUFFIXES: &[&str] = &["ls"];
+
+pub(crate) fn is_official_non_subcommand_suffix(name: &str) -> bool {
+    OFFICIAL_NON_SUBCOMMAND_SUFFIXES.contains(&name)
+}
 
 pub fn dispatch(args: Vec<OsString>) -> Result<ExitCode> {
     let Some((name, forwarded_args)) = args.split_first() else {
@@ -44,6 +50,9 @@ fn binary_name(name: &OsStr) -> Result<OsString> {
     }
     if name.contains('/') || name.contains('\\') || name.contains(std::path::MAIN_SEPARATOR) {
         bail!("external subcommand `{name}` must not contain path separators");
+    }
+    if is_official_non_subcommand_suffix(&name) {
+        bail!("`veryl-{name}` is an official Veryl binary, not an external subcommand");
     }
 
     Ok(OsString::from(format!("veryl-{name}")))

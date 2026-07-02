@@ -55,6 +55,10 @@ pub struct Opt {
     #[arg(long, global = true, hide = true)]
     pub completion: Option<CompletionShell>,
 
+    /// List all commands
+    #[arg(long)]
+    pub list: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

@@ -1,5 +1,5 @@
 use clap::error::ErrorKind;
-use clap::{Command, CommandFactory, Parser};
+use clap::{CommandFactory, Parser};
 use clap_complete::aot::Shell;
 use console::Style;
 use fern::Dispatch;
@@ -22,11 +22,16 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<ExitCode> {
     if root_help_requested(std::env::args_os()) {
-        print_augmented_root_help()?;
+        print_root_help()?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let opt = Opt::parse();
+
+    if opt.list {
+        external_subcommand::print_command_list(Opt::command())?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if let Some(shell) = opt.completion {
         let shell = match shell {
@@ -168,32 +173,15 @@ fn root_help_requested(args: impl IntoIterator<Item = OsString>) -> bool {
         return false;
     };
 
-    args.next().is_none() && (flag == OsStr::new("-h") || flag == OsStr::new("--help"))
+    args.next().is_none()
+        && (flag == OsStr::new("-h") || flag == OsStr::new("--help") || flag == OsStr::new("help"))
 }
 
-fn print_augmented_root_help() -> Result<()> {
+fn print_root_help() -> Result<()> {
     let mut command = Opt::command();
-    let builtins = command
-        .get_subcommands()
-        .map(|subcommand| subcommand.get_name().to_owned())
-        .collect::<Vec<_>>();
-    let builtin_refs = builtins.iter().map(String::as_str).collect::<Vec<_>>();
-
-    for subcommand in external_subcommand::discover_help_subcommands(&builtin_refs) {
-        let about = subcommand
-            .description
-            .map(|description| format!("External: {description}"))
-            .unwrap_or_else(|| {
-                format!(
-                    "External Veryl subcommand from PATH ({})",
-                    subcommand.binary_name
-                )
-            });
-        let command_name = Box::leak(subcommand.name.into_boxed_str());
-        command = command.subcommand(Command::new(command_name as &'static str).about(about));
-    }
-
     command.print_help().into_diagnostic()?;
-    std::io::stdout().write_all(b"\n").into_diagnostic()?;
+    std::io::stdout()
+        .write_all(b"\n\n... See all commands with --list\n")
+        .into_diagnostic()?;
     Ok(())
 }
