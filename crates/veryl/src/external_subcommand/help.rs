@@ -165,10 +165,8 @@ fn probe_info_description(path: &Path) -> Option<String> {
             }
         }
 
-        if child_exited_successfully {
-            if let Some(stdout) = stdout {
-                return parse_info_description(&stdout);
-            }
+        if child_exited_successfully && let Some(stdout) = stdout {
+            return parse_info_description(&stdout);
         }
 
         if !child_exited_successfully {
