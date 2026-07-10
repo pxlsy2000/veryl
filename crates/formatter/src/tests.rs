@@ -68,6 +68,38 @@ fn empty_body_with_comment() {
 }
 
 #[test]
+fn nested_modport_item_path_format() {
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    // Given: a nested modport item path and a direct item with cramped spacing.
+    let code = r#"interface CpuIf{var fatal:logic;modport sink{fatal:input}}
+interface IrqIf{var fatal:logic;inst cpu:CpuIf;modport sink{cpu.sink:modport,fatal:input}}
+"#;
+
+    let expect = r#"interface CpuIf {
+    var fatal: logic;
+    modport sink {
+        fatal: input,
+    }
+}
+interface IrqIf {
+    var fatal: logic;
+    inst cpu: CpuIf;
+    modport sink {
+        cpu.sink: modport,
+        fatal: input,
+    }
+}
+"#;
+
+    // When: the formatter round-trips the source.
+    let ret = format(&metadata, code);
+
+    // Then: nested and direct modport members use the same spacing rules.
+    assert_eq!(ret, expect);
+}
+
+#[test]
 fn empty_list() {
     let code = r#"module ModuleA #(
 

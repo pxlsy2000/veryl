@@ -709,7 +709,10 @@ impl Type {
 
                 let mut temp = vec![];
                 for (id, variable) in &component.variables {
-                    if modport_members.contains_key(&variable.path.first()) {
+                    if modport_members
+                        .keys()
+                        .any(|path| path.strip_prefix(&variable.path.0).is_some())
+                    {
                         let mut member_path = variable.path.clone();
                         member_path.add_prelude(&path.0);
                         temp.push((id, member_path, variable.r#type.clone()));
@@ -754,7 +757,9 @@ impl Type {
 
             let mut temp = vec![];
             for (id, variable) in &component.variables {
-                if let Some(x) = modport_members.get(&variable.path.first()) {
+                if let Some(x) = modport_members.iter().find_map(|(path, direction)| {
+                    path.strip_prefix(&variable.path.0).map(|_| direction)
+                }) {
                     let mut member_path = variable.path.clone();
                     member_path.add_prelude(&path.0);
                     temp.push((id, member_path, *x));

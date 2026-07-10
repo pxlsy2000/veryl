@@ -2284,10 +2284,21 @@ pub trait VerylWalker {
     /// Semantic action for non-terminal 'ModportItem'
     fn modport_item(&mut self, arg: &ModportItem) {
         before!(self, modport_item, arg);
-        self.identifier(&arg.identifier);
+        self.modport_item_path(&arg.modport_item_path);
         self.colon(&arg.colon);
         self.direction(&arg.direction);
         after!(self, modport_item, arg);
+    }
+
+    /// Semantic action for non-terminal 'ModportItemPath'
+    fn modport_item_path(&mut self, arg: &ModportItemPath) {
+        before!(self, modport_item_path, arg);
+        self.identifier(&arg.identifier);
+        for x in &arg.modport_item_path_list {
+            self.dot(&x.dot);
+            self.identifier(&x.identifier);
+        }
+        after!(self, modport_item_path, arg);
     }
 
     /// Semantic action for non-terminal 'ModportDefault'

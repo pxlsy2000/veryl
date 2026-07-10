@@ -788,7 +788,9 @@ ModportList: ModportGroup { Comma ModportGroup } [ Comma ];
 
 ModportGroup: { Attribute } ( LBrace ModportList RBrace | ModportItem );
 
-ModportItem: Identifier Colon Direction;
+ModportItem: ModportItemPath Colon Direction;
+
+ModportItemPath: Identifier { Dot Identifier };
 
 ModportDefault: Input
               | Output

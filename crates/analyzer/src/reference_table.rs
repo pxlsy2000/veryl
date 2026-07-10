@@ -765,7 +765,8 @@ impl ReferenceTable {
                     self.check_complex_identifier(&arg.into(), &token, false);
                 }
                 ReferenceCandidate::ModportItem { arg } => {
-                    let mut path: SymbolPathNamespace = arg.identifier.as_ref().into();
+                    let mut path: SymbolPathNamespace =
+                        arg.modport_item_path.identifier.as_ref().into();
                     path.pop_namespace();
                     self.check_simple_identifier(&path, &arg.into(), None);
                 }

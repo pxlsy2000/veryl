@@ -1,4 +1,7 @@
-use crate::expaneded_modport::{ExpandModportConnectionsTable, ExpandedModportPortTable};
+use crate::expaneded_modport::{
+    ExpandModportConnectionsTable, ExpandedModportPortTable, collect_modport_member_variables,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::rc::Rc;
@@ -20,6 +23,7 @@ use veryl_analyzer::symbol::Direction as SymDirection;
 use veryl_analyzer::symbol::TypeModifierKind as SymTypeModifierKind;
 use veryl_analyzer::symbol::{
     Affiliation, GenericMap, GenericTables, Port, Symbol, SymbolId, SymbolKind, TestType, TypeKind,
+    VariableProperty,
 };
 use veryl_analyzer::symbol_path::{
     GenericSymbolPath, GenericSymbolPathKind, SymbolPath, SymbolPathNamespace,
@@ -52,6 +56,21 @@ enum Mode {
     /// Pass 2: build a `Doc` IR tree in `self.doc_buffer`. The tree is
     /// rendered into `self.string` once walking finishes.
     Build,
+}
+
+#[derive(Clone)]
+struct NestedInterfaceMember {
+    root: StrId,
+    flat_name: String,
+    token: VerylToken,
+    variable: VariableProperty,
+    direction: SymDirection,
+}
+
+#[derive(Default)]
+struct NestedInterfaceForwarding {
+    members_by_root: BTreeMap<StrId, Vec<NestedInterfaceMember>>,
+    emitted_flat_names: BTreeSet<String>,
 }
 
 pub struct Emitter {
@@ -130,6 +149,8 @@ pub struct Emitter {
     // ----- Modport expansion -----------------------------------------------
     modport_connections_tables: Vec<ExpandModportConnectionsTable>,
     modport_ports_table: Option<ExpandedModportPortTable>,
+    nested_interface_forwarding: Vec<NestedInterfaceForwarding>,
+    nested_modport_items: BTreeMap<SymbolId, Vec<ModportItem>>,
 }
 
 impl Default for Emitter {
@@ -189,6 +210,8 @@ impl Default for Emitter {
 
             modport_connections_tables: Vec::new(),
             modport_ports_table: None,
+            nested_interface_forwarding: Vec::new(),
+            nested_modport_items: BTreeMap::new(),
         }
     }
 }
@@ -262,6 +285,7 @@ impl Emitter {
 
     pub fn emit(&mut self, input: &Veryl, raw_input: &str) {
         self.newline = self.format_opt.newline_style.newline_str(raw_input);
+        self.collect_nested_modport_items(input);
         if self.format_opt.vertical_align {
             self.mode = Mode::Align;
             self.duplicated_index = 0;
@@ -1681,6 +1705,409 @@ impl Emitter {
         self.force_duplicated = false;
     }
 
+    fn collect_nested_interface_forwarding(
+        &self,
+        declarations: &[InterfaceDeclarationList],
+        namespace: &Namespace,
+    ) -> NestedInterfaceForwarding {
+        let mut members_by_root: BTreeMap<StrId, Vec<NestedInterfaceMember>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+
+        for declaration in declarations {
+            self.collect_nested_interface_group(
+                &declaration.interface_group,
+                namespace,
+                &mut members_by_root,
+                &mut seen,
+            );
+        }
+
+        NestedInterfaceForwarding {
+            members_by_root,
+            emitted_flat_names: BTreeSet::new(),
+        }
+    }
+
+    fn collect_nested_modport_items(&mut self, input: &Veryl) {
+        self.nested_modport_items.clear();
+        for item in &input.veryl_list {
+            self.collect_nested_modport_description_group(&item.description_group);
+        }
+    }
+
+    fn collect_nested_modport_description_group(&mut self, group: &DescriptionGroup) {
+        match group.description_group_group.as_ref() {
+            DescriptionGroupGroup::LBraceDescriptionGroupGroupListRBrace(x) => {
+                for group in &x.description_group_group_list {
+                    self.collect_nested_modport_description_group(&group.description_group);
+                }
+            }
+            DescriptionGroupGroup::DescriptionItem(x) => {
+                if let DescriptionItem::DescriptionItemOptPublicDescriptionItem(x) =
+                    x.description_item.as_ref()
+                    && let PublicDescriptionItem::InterfaceDeclaration(x) =
+                        x.public_description_item.as_ref()
+                {
+                    self.collect_nested_modport_interface(&x.interface_declaration);
+                }
+            }
+        }
+    }
+
+    fn collect_nested_modport_interface(&mut self, interface: &InterfaceDeclaration) {
+        for declaration in &interface.interface_declaration_list {
+            self.collect_nested_modport_interface_group(&declaration.interface_group);
+        }
+    }
+
+    fn collect_nested_modport_interface_group(&mut self, group: &InterfaceGroup) {
+        match group.interface_group_group.as_ref() {
+            InterfaceGroupGroup::LBraceInterfaceGroupGroupListRBrace(x) => {
+                for group in &x.interface_group_group_list {
+                    self.collect_nested_modport_interface_group(&group.interface_group);
+                }
+            }
+            InterfaceGroupGroup::InterfaceItem(x) => {
+                if let InterfaceItem::ModportDeclaration(x) = x.interface_item.as_ref() {
+                    self.collect_nested_modport_declaration(&x.modport_declaration);
+                }
+            }
+        }
+    }
+
+    fn collect_nested_modport_declaration(&mut self, declaration: &ModportDeclaration) {
+        let Ok(symbol) = symbol_table::resolve(declaration.identifier.as_ref()) else {
+            return;
+        };
+        let Some(items) = &declaration.modport_declaration_opt else {
+            return;
+        };
+
+        let items: Vec<&ModportItem> = items.modport_list.as_ref().into();
+        self.nested_modport_items
+            .insert(symbol.found.id, items.into_iter().cloned().collect());
+    }
+
+    fn collect_nested_interface_group(
+        &self,
+        group: &InterfaceGroup,
+        namespace: &Namespace,
+        members_by_root: &mut BTreeMap<StrId, Vec<NestedInterfaceMember>>,
+        seen: &mut BTreeSet<(StrId, String)>,
+    ) {
+        match group.interface_group_group.as_ref() {
+            InterfaceGroupGroup::LBraceInterfaceGroupGroupListRBrace(x) => {
+                for group in &x.interface_group_group_list {
+                    self.collect_nested_interface_group(
+                        &group.interface_group,
+                        namespace,
+                        members_by_root,
+                        seen,
+                    );
+                }
+            }
+            InterfaceGroupGroup::InterfaceItem(x) => {
+                if let InterfaceItem::ModportDeclaration(x) = x.interface_item.as_ref()
+                    && let Some(items) = &x.modport_declaration.modport_declaration_opt
+                {
+                    let items: Vec<&ModportItem> = items.modport_list.as_ref().into();
+                    for item in items {
+                        for member in self
+                            .collect_nested_modport_item(item.modport_item_path.as_ref(), namespace)
+                        {
+                            if seen.insert((member.root, member.flat_name.clone())) {
+                                members_by_root.entry(member.root).or_default().push(member);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_nested_modport_item(
+        &self,
+        path: &ModportItemPath,
+        namespace: &Namespace,
+    ) -> Vec<NestedInterfaceMember> {
+        let mut visiting = BTreeSet::new();
+        self.collect_nested_modport_item_with_prefix(
+            path,
+            namespace,
+            &[],
+            &path.identifier.identifier_token,
+            &mut visiting,
+        )
+    }
+
+    fn collect_nested_modport_item_with_prefix(
+        &self,
+        path: &ModportItemPath,
+        namespace: &Namespace,
+        prefix: &[StrId],
+        token: &VerylToken,
+        visiting: &mut BTreeSet<SymbolId>,
+    ) -> Vec<NestedInterfaceMember> {
+        if path.modport_item_path_list.is_empty() {
+            return Vec::new();
+        }
+
+        let mut ids = vec![path.identifier.text()];
+        ids.extend(
+            path.modport_item_path_list
+                .iter()
+                .map(|x| x.identifier.text()),
+        );
+        let Some((_, instance_path)) = ids.split_last() else {
+            return Vec::new();
+        };
+        if instance_path.is_empty() {
+            return Vec::new();
+        }
+
+        let resolved_namespace = symbol_table::resolve(path.identifier.as_ref())
+            .ok()
+            .map(|x| x.found.namespace.clone());
+        let symbol_path = SymbolPath::new(&ids);
+        let Ok(symbol) = symbol_table::resolve((
+            &symbol_path,
+            resolved_namespace.as_ref().unwrap_or(namespace),
+        )) else {
+            return Vec::new();
+        };
+        if !matches!(symbol.found.kind, SymbolKind::Modport(_)) {
+            return Vec::new();
+        }
+
+        let mut full_instance_path = prefix.to_vec();
+        full_instance_path.extend(instance_path);
+        self.collect_nested_modport_symbol_members(
+            &symbol.found,
+            &full_instance_path,
+            token,
+            visiting,
+        )
+    }
+
+    fn collect_nested_modport_symbol_members(
+        &self,
+        symbol: &Symbol,
+        instance_path: &[StrId],
+        token: &VerylToken,
+        visiting: &mut BTreeSet<SymbolId>,
+    ) -> Vec<NestedInterfaceMember> {
+        if !visiting.insert(symbol.id) {
+            return Vec::new();
+        }
+
+        let mut members: Vec<NestedInterfaceMember> =
+            if let Some((&root, _)) = instance_path.split_first() {
+                collect_modport_member_variables(symbol)
+                    .into_iter()
+                    .map(|(variable_token, variable, direction)| {
+                        let mut flat_path: Vec<String> =
+                            instance_path.iter().map(ToString::to_string).collect();
+                        flat_path.push(variable_token.to_string());
+                        let flat_name = flat_path.join("__");
+                        NestedInterfaceMember {
+                            root,
+                            flat_name: flat_name.clone(),
+                            token: token.replace(&flat_name),
+                            variable,
+                            direction,
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        if let Some(items) = self.nested_modport_items.get(&symbol.id) {
+            for item in items {
+                if matches!(item.direction.as_ref(), Direction::Modport(_)) {
+                    members.extend(self.collect_nested_modport_item_with_prefix(
+                        item.modport_item_path.as_ref(),
+                        &symbol.namespace,
+                        instance_path,
+                        token,
+                        visiting,
+                    ));
+                }
+            }
+        }
+
+        visiting.remove(&symbol.id);
+        members
+    }
+
+    fn emit_nested_interface_declarations(&mut self, root: StrId) -> bool {
+        let members = self.nested_interface_forwarding.last_mut().and_then(|x| {
+            let members = x.members_by_root.get(&root)?;
+            let pending: Vec<_> = members
+                .iter()
+                .filter(|member| x.emitted_flat_names.insert(member.flat_name.clone()))
+                .cloned()
+                .collect();
+            Some(pending)
+        });
+        let Some(members) = members else {
+            return false;
+        };
+
+        for (i, member) in members.iter().enumerate() {
+            if i != 0 {
+                self.newline();
+            }
+            let Some(array_type) = member.variable.r#type.array_type.as_ref() else {
+                continue;
+            };
+            self.scalar_type(&array_type.scalar_type);
+            self.space(1);
+            self.align_start(align_kind::IDENTIFIER);
+            self.duplicated_token(&member.token);
+            self.align_finish(align_kind::IDENTIFIER);
+            if let Some(ref x) = array_type.array_type_opt {
+                self.space(1);
+                self.array(&x.array);
+            }
+            self.str(";");
+        }
+        true
+    }
+
+    fn emit_modport_item_path(&mut self, path: &ModportItemPath) {
+        self.identifier(&path.identifier);
+        for x in &path.modport_item_path_list {
+            self.dot(&x.dot);
+            self.identifier(&x.identifier);
+        }
+    }
+
+    fn emit_nested_modport_item(&mut self, arg: &ModportItem) -> bool {
+        if !matches!(arg.direction.as_ref(), Direction::Modport(_)) {
+            return false;
+        }
+        let Some(namespace) = self
+            .nested_interface_forwarding
+            .last()
+            .and_then(|_| symbol_table::resolve(arg.modport_item_path.identifier.as_ref()).ok())
+            .map(|x| x.found.namespace.clone())
+        else {
+            return false;
+        };
+        let members = self.collect_nested_modport_item(arg.modport_item_path.as_ref(), &namespace);
+        if members.is_empty() {
+            return false;
+        }
+
+        for (i, member) in members.iter().enumerate() {
+            if i != 0 {
+                self.str(",");
+                self.newline();
+            }
+            let direction = arg.colon.colon_token.replace(&member.direction.to_string());
+            self.align_start(align_kind::DIRECTION);
+            self.duplicated_token(&direction);
+            self.align_finish(align_kind::DIRECTION);
+            self.space(1);
+            self.align_start(align_kind::IDENTIFIER);
+            self.duplicated_token(&member.token);
+            self.align_finish(align_kind::IDENTIFIER);
+        }
+        true
+    }
+
+    fn nested_modport_reference(
+        &self,
+        arg: &ExpressionIdentifier,
+    ) -> Option<(VerylToken, String, usize)> {
+        if !arg.expression_identifier_list.is_empty() || arg.expression_identifier_list0.len() < 2 {
+            return None;
+        }
+        let terminal_member = arg.expression_identifier_list0.len().saturating_sub(1);
+        if arg
+            .expression_identifier_list0
+            .iter()
+            .take(terminal_member)
+            .any(|x| !x.expression_identifier_list0_list.is_empty())
+        {
+            return None;
+        }
+
+        let base = symbol_table::resolve(arg.scoped_identifier.as_ref()).ok()?;
+        let SymbolKind::Port(port) = &base.found.kind else {
+            return None;
+        };
+        let Some((_, Some(modport))) = port.r#type.trace_user_defined(Some(&base.found.namespace))
+        else {
+            return None;
+        };
+        if !matches!(modport.kind, SymbolKind::Modport(_)) {
+            return None;
+        }
+        let port_identifier = arg.scoped_identifier.identifier();
+        let path_segments = arg
+            .expression_identifier_list0
+            .iter()
+            .map(|x| x.identifier.text().to_string())
+            .collect::<Vec<_>>();
+        let mut visiting = BTreeSet::new();
+        let members = self
+            .collect_nested_modport_symbol_members(&modport, &[], &port_identifier, &mut visiting);
+        for prefix_len in (1..=path_segments.len()).rev() {
+            let flat_path = path_segments[..prefix_len].join("__");
+            if members.iter().any(|member| member.flat_name == flat_path) {
+                let text = format!("{port_identifier}.{flat_path}");
+                return Some((port_identifier.clone(), text, prefix_len));
+            }
+        }
+        None
+    }
+
+    fn nested_interface_local_reference(
+        &self,
+        arg: &ExpressionIdentifier,
+    ) -> Option<(VerylToken, String, usize)> {
+        if !arg.expression_identifier_list.is_empty() || arg.expression_identifier_list0.is_empty()
+        {
+            return None;
+        }
+        let terminal_member = arg.expression_identifier_list0.len().saturating_sub(1);
+        if arg
+            .expression_identifier_list0
+            .iter()
+            .take(terminal_member)
+            .any(|x| !x.expression_identifier_list0_list.is_empty())
+        {
+            return None;
+        }
+
+        let root = arg.scoped_identifier.identifier();
+        let mut path_segments = vec![root.to_string()];
+        path_segments.extend(
+            arg.expression_identifier_list0
+                .iter()
+                .map(|x| x.identifier.text().to_string()),
+        );
+        let members = self
+            .nested_interface_forwarding
+            .last()
+            .and_then(|x| x.members_by_root.get(&root.token.text))?;
+        for prefix_len in (1..=path_segments.len()).rev() {
+            let text = path_segments[..prefix_len].join("__");
+            if members.iter().any(|x| x.flat_name == text) {
+                return Some((root.clone(), text, prefix_len - 1));
+            }
+        }
+        None
+    }
+
+    fn is_forwarded_nested_interface_root(&self, id: StrId) -> bool {
+        self.nested_interface_forwarding
+            .last()
+            .is_some_and(|x| x.members_by_root.contains_key(&id))
+    }
+
     fn emit_inst(
         &mut self,
         header_token: &VerylToken,
@@ -3040,10 +3467,17 @@ impl VerylWalker for Emitter {
                 )
                 .map(|x| (port_identifier, x));
         }
+        let nested_reference = if expanded_modport.is_none() {
+            self.nested_interface_local_reference(arg)
+                .or_else(|| self.nested_modport_reference(arg))
+        } else {
+            None
+        };
 
         let array_size = if self.build_opt.flatten_array_interface
             && !arg.expression_identifier_list.is_empty()
             && expanded_modport.is_none()
+            && nested_reference.is_none()
         {
             self.get_inst_modport_array_size(&arg.scoped_identifier.as_ref().into())
         } else {
@@ -3055,6 +3489,9 @@ impl VerylWalker for Emitter {
             let text = modport_member.identifier.to_string();
             self.veryl_token(&token.replace(&text));
             self.push_resolved_identifier(&text);
+        } else if let Some((token, text, _)) = nested_reference.as_ref() {
+            self.veryl_token(&token.replace(text));
+            self.push_resolved_identifier(text);
         } else if array_size.len() > 1 {
             let select: Vec<_> = arg
                 .expression_identifier_list
@@ -3074,8 +3511,9 @@ impl VerylWalker for Emitter {
             }
         }
 
+        let nested_skip = nested_reference.as_ref().map_or(0, |(_, _, len)| *len);
         for (i, x) in arg.expression_identifier_list0.iter().enumerate() {
-            if i > 0 || expanded_modport.is_none() {
+            if i >= nested_skip && (i > 0 || expanded_modport.is_none()) {
                 self.dot(&x.dot);
                 self.push_resolved_identifier(".");
                 if (i + 1) < arg.expression_identifier_list0.len() {
@@ -4895,11 +5333,69 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'ModportItem'
     fn modport_item(&mut self, arg: &ModportItem) {
+        if self.emit_nested_modport_item(arg) {
+            return;
+        }
+
         self.direction(&arg.direction);
         self.space(1);
         self.align_start(align_kind::IDENTIFIER);
-        self.identifier(&arg.identifier);
+        self.emit_modport_item_path(&arg.modport_item_path);
         self.align_finish(align_kind::IDENTIFIER);
+    }
+
+    /// Semantic action for non-terminal 'GenerateItem'
+    fn generate_item(&mut self, arg: &GenerateItem) {
+        match arg {
+            GenerateItem::InstDeclaration(x)
+                if self.is_forwarded_nested_interface_root(
+                    x.inst_declaration.component_instantiation.identifier.text(),
+                ) =>
+            {
+                self.emit_nested_interface_declarations(
+                    x.inst_declaration.component_instantiation.identifier.text(),
+                );
+            }
+            GenerateItem::LetDeclaration(x) => self.let_declaration(&x.let_declaration),
+            GenerateItem::VarDeclaration(x) => self.var_declaration(&x.var_declaration),
+            GenerateItem::InstDeclaration(x) => self.inst_declaration(&x.inst_declaration),
+            GenerateItem::BindDeclaration(x) => self.bind_declaration(&x.bind_declaration),
+            GenerateItem::ConstDeclaration(x) => self.const_declaration(&x.const_declaration),
+            GenerateItem::GenDeclaration(x) => self.gen_declaration(&x.gen_declaration),
+            GenerateItem::AlwaysFfDeclaration(x) => {
+                self.always_ff_declaration(&x.always_ff_declaration)
+            }
+            GenerateItem::AlwaysCombDeclaration(x) => {
+                self.always_comb_declaration(&x.always_comb_declaration)
+            }
+            GenerateItem::AssignDeclaration(x) => self.assign_declaration(&x.assign_declaration),
+            GenerateItem::ConnectDeclaration(x) => self.connect_declaration(&x.connect_declaration),
+            GenerateItem::FunctionDeclaration(x) => {
+                self.function_declaration(&x.function_declaration)
+            }
+            GenerateItem::GenerateIfDeclaration(x) => {
+                self.generate_if_declaration(&x.generate_if_declaration)
+            }
+            GenerateItem::GenerateForDeclaration(x) => {
+                self.generate_for_declaration(&x.generate_for_declaration)
+            }
+            GenerateItem::GenerateBlockDeclaration(x) => {
+                self.generate_block_declaration(&x.generate_block_declaration)
+            }
+            GenerateItem::TypeDefDeclaration(x) => {
+                self.type_def_declaration(&x.type_def_declaration)
+            }
+            GenerateItem::EnumDeclaration(x) => self.enum_declaration(&x.enum_declaration),
+            GenerateItem::StructUnionDeclaration(x) => {
+                self.struct_union_declaration(&x.struct_union_declaration)
+            }
+            GenerateItem::ImportDeclaration(x) => self.import_declaration(&x.import_declaration),
+            GenerateItem::AliasDeclaration(x) => self.alias_declaration(&x.alias_declaration),
+            GenerateItem::InitialDeclaration(x) => self.initial_declaration(&x.initial_declaration),
+            GenerateItem::FinalDeclaration(x) => self.final_declaration(&x.final_declaration),
+            GenerateItem::UnsafeBlock(x) => self.unsafe_block(&x.unsafe_block),
+            GenerateItem::EmbedDeclaration(x) => self.embed_declaration(&x.embed_declaration),
+        }
     }
 
     /// Semantic action for non-terminal 'EnumDeclaration'
@@ -5818,6 +6314,11 @@ impl VerylWalker for Emitter {
                 }
                 self.with_parameter(&x.with_parameter);
             }
+            let forwarding = self.collect_nested_interface_forwarding(
+                &arg.interface_declaration_list,
+                &symbol.found.namespace,
+            );
+            self.nested_interface_forwarding.push(forwarding);
             self.token_will_push(&arg.l_brace.l_brace_token.replace(";"));
             for (i, x) in arg.interface_declaration_list.iter().enumerate() {
                 self.newline_list(i);
@@ -5832,6 +6333,7 @@ impl VerylWalker for Emitter {
             self.emit_global_functions(&symbol.found);
             self.newline_list_post(arg.interface_declaration_list.is_empty());
             self.token(&arg.r_brace.r_brace_token.replace("endinterface"));
+            self.nested_interface_forwarding.pop();
 
             self.pop_generic_map();
             self.align_reset();

@@ -1273,9 +1273,23 @@ impl VerylGrammarTrait for CreateSymbolTable {
                     Vec::new()
                 };
 
+                let mut nested_prefixes = HashSet::new();
                 for item in items {
                     let kind = match &*item.direction {
                         Direction::Modport(_) => {
+                            let path = item.modport_item_path.as_ref();
+                            let root = path.identifier.text();
+                            if !path.modport_item_path_list.is_empty()
+                                && nested_prefixes.insert(root)
+                                && let Some(id) = self.interface_members.get(&root).copied()
+                                && let Some(symbol) = symbol_table::get(id)
+                            {
+                                self.insert_symbol(
+                                    &path.identifier.identifier_token.token,
+                                    symbol.kind,
+                                    false,
+                                );
+                            }
                             continue;
                         }
                         Direction::Import(_) => {
@@ -1295,9 +1309,11 @@ impl VerylGrammarTrait for CreateSymbolTable {
                         }
                     };
 
-                    if let Some(id) =
-                        self.insert_symbol(&item.identifier.identifier_token.token, kind, false)
-                    {
+                    if let Some(id) = self.insert_symbol(
+                        &item.modport_item_path.identifier.identifier_token.token,
+                        kind,
+                        false,
+                    ) {
                         members.push(id);
                         self.modport_member_ids.push(id);
                     }
@@ -1605,7 +1621,11 @@ impl VerylGrammarTrait for CreateSymbolTable {
                 clock_domain,
             };
             let kind = SymbolKind::Instance(property);
-            self.insert_symbol(&inst.identifier.identifier_token.token, kind, false);
+            if let Some(id) =
+                self.insert_symbol(&inst.identifier.identifier_token.token, kind, false)
+            {
+                self.push_interface_member(&inst.identifier, id);
+            }
         }
         Ok(())
     }

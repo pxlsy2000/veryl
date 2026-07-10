@@ -3,8 +3,8 @@ use crate::conv::conv_profiler::{ConvProfile, ConvProfileGuard};
 use crate::conv::instance::{InstanceHistory, InstanceHistoryError};
 use crate::ir::{
     Component, Comptime, Declaration, Expression, FfClock, FfReset, FuncPath, Function, Interface,
-    IrResult, ShapeRef, Signature, Type, VarId, VarIndex, VarKind, VarPath, VarSelect, Variable,
-    VariableInfo,
+    IrResult, ModportMemberPath, ShapeRef, Signature, Type, VarId, VarIndex, VarKind, VarPath,
+    VarSelect, Variable, VariableInfo,
 };
 use crate::namespace::Namespace;
 use crate::scope;
@@ -57,7 +57,9 @@ pub struct Context {
     pub variables: HashMap<VarId, Variable>,
     pub functions: HashMap<VarId, Function>,
     pub port_types: HashMap<VarPath, (Type, ClockDomain)>,
-    pub modports: HashMap<StrId, Vec<(StrId, Direction)>>,
+    pub modports: HashMap<StrId, Vec<(ModportMemberPath, Direction)>>,
+    nested_modport_flat_names: HashMap<String, ModportMemberPath>,
+    nested_modport_flat_name_scopes: Vec<HashMap<String, ModportMemberPath>>,
     pub declarations: Vec<Declaration>,
     pub default_clock: Option<(VarPath, SymbolId)>,
     pub default_reset: Option<(VarPath, SymbolId)>,
@@ -283,8 +285,30 @@ impl Context {
         }
     }
 
-    pub fn insert_modport(&mut self, name: StrId, members: Vec<(StrId, Direction)>) {
+    pub fn insert_modport(&mut self, name: StrId, members: Vec<(ModportMemberPath, Direction)>) {
         self.modports.insert(name, members);
+    }
+
+    pub fn with_nested_modport_flat_name_scope<F, T>(&mut self, f: F) -> IrResult<T>
+    where
+        F: FnOnce(&mut Context) -> IrResult<T>,
+    {
+        self.nested_modport_flat_name_scopes
+            .push(std::mem::take(&mut self.nested_modport_flat_names));
+        let ret = f(self);
+        self.nested_modport_flat_names = self
+            .nested_modport_flat_name_scopes
+            .pop()
+            .unwrap_or_default();
+        ret
+    }
+
+    pub fn nested_modport_flat_name(&self, name: &str) -> Option<&ModportMemberPath> {
+        self.nested_modport_flat_names.get(name)
+    }
+
+    pub fn insert_nested_modport_flat_name(&mut self, name: String, path: ModportMemberPath) {
+        self.nested_modport_flat_names.insert(name, path);
     }
 
     pub fn extract_function(&mut self, context: &mut Context, base: &VarPath, array: &ShapeRef) {
@@ -358,7 +382,9 @@ impl Context {
         let mut id_map = HashMap::default();
         for mut variable in component.variables.into_values() {
             if modport.is_some() {
-                if let Some(x) = modport_members.get(&variable.path.first()) {
+                if let Some(x) = modport_members.iter().find_map(|(path, direction)| {
+                    path.strip_prefix(&variable.path.0).map(|_| direction)
+                }) {
                     variable.kind = match x {
                         Direction::Input => VarKind::Input,
                         Direction::Output => VarKind::Output,
@@ -667,7 +693,7 @@ impl Context {
         self.functions.drain().collect()
     }
 
-    pub fn drain_modports(&mut self) -> HashMap<StrId, Vec<(StrId, Direction)>> {
+    pub fn drain_modports(&mut self) -> HashMap<StrId, Vec<(ModportMemberPath, Direction)>> {
         self.modports.drain().collect()
     }
 

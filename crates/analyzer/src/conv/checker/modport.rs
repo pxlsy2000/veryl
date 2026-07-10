@@ -83,8 +83,26 @@ pub fn check_modport_in_port(context: &mut Context, arg: &PortDeclarationItem) {
 }
 
 pub fn check_modport(context: &mut Context, arg: &ModportItem) {
-    let mut path: SymbolPathNamespace = arg.identifier.as_ref().into();
+    let identifier = arg.modport_item_path.identifier.as_ref();
+    let mut path: SymbolPathNamespace = identifier.into();
+    let token: veryl_parser::token_range::TokenRange = identifier.into();
     path.pop_namespace();
+
+    if !arg.modport_item_path.modport_item_path_list.is_empty()
+        && !matches!(&*arg.direction, Direction::Modport(_))
+    {
+        let mut item_path = identifier.identifier_token.token.to_string();
+        for segment in &arg.modport_item_path.modport_item_path_list {
+            item_path.push('.');
+            item_path.push_str(&segment.identifier.identifier_token.token.to_string());
+        }
+        context.insert_error(AnalyzerError::invalid_modport_item(
+            InvalidModportItemKind::Variable,
+            &item_path,
+            &token,
+        ));
+        return;
+    }
 
     if let Ok(symbol) = symbol_table::resolve(path) {
         match &*arg.direction {
@@ -93,8 +111,8 @@ pub fn check_modport(context: &mut Context, arg: &ModportItem) {
                 if !is_function_defined_in_interface(&symbol.found) {
                     context.insert_error(AnalyzerError::invalid_modport_item(
                         InvalidModportItemKind::Function,
-                        &arg.identifier.identifier_token.token.to_string(),
-                        &arg.identifier.as_ref().into(),
+                        &identifier.identifier_token.token.to_string(),
+                        &token,
                     ));
                 }
             }
@@ -102,8 +120,8 @@ pub fn check_modport(context: &mut Context, arg: &ModportItem) {
                 if !matches!(symbol.found.kind, SymbolKind::Variable(_)) {
                     context.insert_error(AnalyzerError::invalid_modport_item(
                         InvalidModportItemKind::Variable,
-                        &arg.identifier.identifier_token.token.to_string(),
-                        &arg.identifier.as_ref().into(),
+                        &identifier.identifier_token.token.to_string(),
+                        &token,
                     ));
                 }
             }

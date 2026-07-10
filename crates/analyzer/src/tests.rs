@@ -1,6 +1,8 @@
 use crate::conv::Context;
 use crate::ir::Ir;
-use crate::{Analyzer, AnalyzerError, attribute_table, symbol_table};
+use crate::{
+    Analyzer, AnalyzerError, analyzer_error::InvalidModportItemKind, attribute_table, symbol_table,
+};
 use std::collections::HashMap;
 use std::thread;
 use veryl_metadata::{Lint, Metadata, ProjectProperty};
@@ -1702,7 +1704,13 @@ fn invalid_direction() {
     "#;
 
     let errors = analyze(code);
-    assert!(matches!(errors[0], AnalyzerError::InvalidDirection { .. }));
+    assert!(matches!(
+        errors[0],
+        AnalyzerError::InvalidModportItem {
+            kind: InvalidModportItemKind::Modport,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -2069,6 +2077,663 @@ fn invalid_modport_item() {
 
     let errors = analyze(code);
     assert!(errors.is_empty());
+}
+
+#[test]
+fn nested_modport_forwarding_resolves() {
+    let code = r#"
+    interface CpuIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+        modport source {
+            fatal: output,
+        }
+    }
+
+    interface SubIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface RecursiveCpuIf {
+        inst sub: SubIf;
+        modport deep {
+            sub.sink: modport,
+        }
+    }
+
+    interface ClusterIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        inst cluster: ClusterIf;
+        inst recursive: RecursiveCpuIf;
+        modport sink {
+            cpu.sink: modport,
+            cluster.cpu.sink: modport,
+        }
+        modport deep {
+            recursive.deep: modport,
+        }
+        modport source {
+            cpu.source: modport,
+        }
+    }
+
+    module Cpu (
+        irq: modport IrqIf::sink,
+        out: output logic,
+    ) {
+        assign out = irq.cpu.fatal | irq.cluster.cpu.fatal;
+    }
+
+    module Source (
+        irq: modport IrqIf::source,
+    ) {
+        assign irq.cpu.fatal = 1;
+    }
+
+    module DeepCpu (
+        irq: modport IrqIf::deep,
+        out: output logic,
+    ) {
+        assign out = irq.recursive.sub.fatal;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let recursive_code = r#"
+    interface SubIf {
+        var fatal: logic;
+
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface CpuIf {
+        inst sub: SubIf;
+
+        modport deep {
+            sub.sink: modport,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        inst aux: SubIf;
+        #[allow(unused_variable)]
+        let seen: logic = cpu.sub.fatal;
+
+        modport sink {
+            aux.sink: modport,
+        }
+
+        modport deep {
+            cpu.deep: modport,
+        }
+    }
+
+    module Cpu (
+        irq: modport IrqIf::deep,
+        out: output logic,
+    ) {
+        assign out = irq.cpu.sub.fatal;
+    }
+    "#;
+
+    let errors = analyze(recursive_code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn nested_modport_forwarding_allows_unused_child_members() {
+    let code = r#"
+    interface CpuIf {
+        var fatal: logic;
+        #[allow(unused_variable)]
+        var hidden: logic;
+        function get_fatal() -> logic {
+            return fatal;
+        }
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+
+    module Cpu (
+        irq: modport IrqIf::sink,
+        out: output logic,
+    ) {
+        assign out = irq.cpu.fatal;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_partial_forward_local_reference() {
+    let code = r#"
+    interface CpuIf {
+        var fatal: logic;
+        var hidden: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        let seen: logic = cpu.hidden;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_child_function_local_reference() {
+    let code = r#"
+    interface CpuIf {
+        var fatal: logic;
+        function get_fatal() -> logic {
+            return fatal;
+        }
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        let seen: logic = cpu.get_fatal();
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_child_import_dependency() {
+    let code = r#"
+    package PayloadPkg {
+        struct Payload {
+            b: logic,
+        }
+    }
+
+    interface ChildIf {
+        import PayloadPkg::*;
+        var payload: Payload;
+        modport sink {
+            payload: input,
+        }
+    }
+
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.iter().any(|e| {
+            matches!(
+                e,
+                AnalyzerError::InvalidModportItem {
+                    kind: InvalidModportItemKind::Modport,
+                    ..
+                }
+            )
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_let_terminal() {
+    let code = r#"
+    interface ChildIf {
+        let ready: logic = 1'b1;
+        modport sink {
+            ready: input,
+        }
+    }
+
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.iter().any(|e| {
+            matches!(
+                e,
+                AnalyzerError::InvalidModportItem {
+                    kind: InvalidModportItemKind::Modport,
+                    ..
+                }
+            )
+        }),
+        "{errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.to_string().contains("plain variable")),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_dotted_direct_member() {
+    let code = r#"
+    package PayloadPkg {
+        struct Payload {
+            a: logic,
+        }
+    }
+
+    interface IrqIf {
+        import PayloadPkg::*;
+        var payload: Payload;
+        modport sink {
+            payload.a: input,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.iter().any(|e| {
+            matches!(
+                e,
+                AnalyzerError::InvalidModportItem {
+                    kind: InvalidModportItemKind::Variable,
+                    identifier,
+                    ..
+                } if identifier == "payload.a"
+            )
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_cross_modport_flat_name_collision() {
+    let code = r#"
+    interface SubIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface CpuIf {
+        inst sub: SubIf;
+        modport deep {
+            sub.sink: modport,
+        }
+    }
+
+    interface ParentIf {
+        inst cpu: CpuIf;
+        inst cpu__sub: SubIf;
+        modport conflict {
+            cpu.deep: modport,
+            cpu__sub.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.iter().any(|e| {
+            matches!(
+                e,
+                AnalyzerError::InvalidModportItem {
+                    kind: InvalidModportItemKind::Modport,
+                    ..
+                }
+            )
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_allows_cross_modport_same_terminal_reuse() {
+    let code = r#"
+    interface ChildIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+        modport monitor {
+            fatal: input,
+        }
+    }
+
+    interface ParentIf {
+        inst cpu: ChildIf;
+        modport a {
+            cpu.sink: modport,
+        }
+        modport b {
+            cpu.monitor: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_cross_modport_different_path_collision() {
+    let code = r#"
+    interface SubIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface CpuIf {
+        inst sub: SubIf;
+        modport deep {
+            sub.sink: modport,
+        }
+    }
+
+    interface ParentIf {
+        inst cpu: CpuIf;
+        inst cpu__sub: SubIf;
+        modport from_cpu {
+            cpu.deep: modport,
+        }
+        modport from_flat {
+            cpu__sub.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.iter().any(|e| {
+            matches!(
+                e,
+                AnalyzerError::InvalidModportItem {
+                    kind: InvalidModportItemKind::Modport,
+                    ..
+                }
+            )
+        }),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_allows_independent_parent_flat_names() {
+    let child_code = r#"
+    interface SubIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface CpuIf {
+        inst sub: SubIf;
+        modport sink {
+            sub.sink: modport,
+        }
+    }
+    "#;
+
+    let parent_a_code = r#"
+    interface ParentAIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let parent_b_code = r#"
+    interface ParentBIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let module_code = r#"
+    module ModuleA (
+        a: modport ParentAIf::sink,
+        b: modport ParentBIf::sink,
+        out: output logic,
+    ) {
+        assign out = a.cpu.sub.fatal | b.cpu.sub.fatal;
+    }
+    "#;
+
+    let errors = analyze_multiple_inputs(&[child_code, parent_a_code, parent_b_code, module_code]);
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_flat_name_collisions() {
+    let explicit_member_collision = r#"
+    interface CpuIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        var cpu__fatal: logic;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(explicit_member_collision);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        "{errors:?}"
+    );
+
+    let forwarded_path_collision = r#"
+    interface SubIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface CpuIf {
+        inst sub: SubIf;
+        var sub__fatal: logic;
+        modport sink {
+            sub__fatal: input,
+        }
+        modport deep {
+            sub.sink: modport,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        inst cpu__sub: SubIf;
+        modport sink {
+            cpu.sink: modport,
+            cpu__sub.sink: modport,
+        }
+        modport deep {
+            cpu.deep: modport,
+            cpu__sub.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(forwarded_path_collision);
+    assert!(
+        errors
+            .iter()
+            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_forwarding_rejects_unsupported() {
+    let missing_child_modport = r#"
+    interface CpuIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.bad: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(missing_child_modport);
+    assert!(!errors.is_empty(), "{errors:?}");
+
+    let non_interface_intermediate = r#"
+    interface CpuIf {
+        var fatal: logic;
+        modport sink {
+            fatal.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(non_interface_intermediate);
+    assert!(!errors.is_empty(), "{errors:?}");
+
+    let function_terminal = r#"
+    interface CpuIf {
+        function fatal() -> logic {
+            return 0;
+        }
+        modport sink {
+            fatal: import,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(function_terminal);
+    assert!(!errors.is_empty(), "{errors:?}");
+
+    let arrayed_interface_instance = r#"
+    interface CpuIf {
+        var fatal: logic;
+        modport sink {
+            fatal: input,
+        }
+    }
+
+    interface IrqIf {
+        inst cpu: CpuIf [2];
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(arrayed_interface_instance);
+    assert!(matches!(
+        errors[0],
+        AnalyzerError::InvalidModportItem {
+            kind: InvalidModportItemKind::ArrayedInterface,
+            ..
+        }
+    ));
+
+    let cyclic_recursion = r#"
+    interface InterfaceA {
+        inst b: InterfaceB;
+        modport sink {
+            b.sink: modport,
+        }
+    }
+
+    interface InterfaceB {
+        inst a: InterfaceA;
+        modport sink {
+            a.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(cyclic_recursion);
+    assert!(!errors.is_empty(), "{errors:?}");
 }
 
 #[test]

@@ -34,6 +34,7 @@ fn check_path(
         matches!(
             this_symbol.kind,
             SymbolKind::Variable(_) // member variable of instance
+            | SymbolKind::Instance(_)
             | SymbolKind::StructMember(_)
             | SymbolKind::UnionMember(_)
             | SymbolKind::Modport(_)

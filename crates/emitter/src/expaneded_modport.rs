@@ -499,7 +499,7 @@ fn expand_array_index(array_size: &[isize], array_index: &[Vec<isize>]) -> Vec<V
     }
 }
 
-fn collect_modport_member_variables(
+pub(crate) fn collect_modport_member_variables(
     symbol: &Symbol,
 ) -> Vec<(Token, VariableProperty, SymDirection)> {
     let SymbolKind::Modport(modport) = &symbol.kind else {

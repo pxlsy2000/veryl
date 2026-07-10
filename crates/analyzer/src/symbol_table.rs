@@ -801,6 +801,7 @@ impl SymbolTable {
 
         match &found.kind {
             SymbolKind::Variable(_)
+            | SymbolKind::Instance(_)
             | SymbolKind::ModportFunctionMember(_)
             | SymbolKind::ModportVariableMember(_) => via_modport || via_interface_instance,
             SymbolKind::StructMember(_) | SymbolKind::UnionMember(_) => matches!(

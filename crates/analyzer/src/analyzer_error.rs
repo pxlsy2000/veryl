@@ -528,7 +528,7 @@ pub enum AnalyzerError {
         help(""),
         url("https://doc.veryl-lang.org/book/07_appendix/02_semantic_error.html#{}", self.code().unwrap())
     )]
-    #[error("\"{identifier}\" is not a {kind}")]
+    #[error("\"{identifier}\" is not a valid modport item: {kind}")]
     InvalidModportItem {
         kind: InvalidModportItemKind,
         identifier: String,
@@ -3366,14 +3366,22 @@ impl fmt::Display for InvalidModifierKind {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum InvalidModportItemKind {
+    ArrayedInterface,
     Function,
+    Modport,
     Variable,
 }
 
 impl fmt::Display for InvalidModportItemKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            InvalidModportItemKind::ArrayedInterface => {
+                "unsupported nested modport because interface arrays are unsupported".fmt(f)
+            }
             InvalidModportItemKind::Function => "function".fmt(f),
+            InvalidModportItemKind::Modport => {
+                "unsupported nested modport item because the terminal is not a plain variable".fmt(f)
+            }
             InvalidModportItemKind::Variable => "variable".fmt(f),
         }
     }

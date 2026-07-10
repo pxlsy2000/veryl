@@ -1074,7 +1074,19 @@ impl_token_range!(ConnectDeclaration, connect, semicolon);
 impl_token_range!(ModportDeclaration, modport, r_brace);
 impl_token_range_list!(ModportList, ModportGroup);
 impl_token_range_group!(ModportGroup, ModportList, ModportItem);
-impl_token_range!(ModportItem, identifier, direction);
+impl_token_range!(ModportItem, modport_item_path, direction);
+
+impl From<&ModportItemPath> for TokenRange {
+    fn from(value: &ModportItemPath) -> Self {
+        let mut ret: TokenRange = value.identifier.as_ref().into();
+        if let Some(x) = value.modport_item_path_list.last() {
+            let end: TokenRange = x.identifier.as_ref().into();
+            ret.end = end.end;
+        }
+        ret
+    }
+}
+impl_token_ext!(ModportItemPath);
 
 impl From<&ModportDefault> for TokenRange {
     fn from(value: &ModportDefault) -> Self {

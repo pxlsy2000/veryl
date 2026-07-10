@@ -1,4 +1,6 @@
-use crate::analyzer_error::{AnalyzerError, MismatchTypeKind, UnevaluableValueKind};
+use crate::analyzer_error::{
+    AnalyzerError, InvalidModportItemKind, MismatchTypeKind, UnevaluableValueKind,
+};
 use crate::attribute::{AllowItem, Attribute};
 use crate::attribute_table;
 use crate::conv::checker::alias::{AliasType, check_alias_target};
@@ -21,17 +23,18 @@ use crate::conv::utils::{
 };
 use crate::conv::{Affiliation, Context, Conv};
 use crate::ir::{
-    self, Comptime, FuncArg, FuncPath, InstanceKind, IrResult, Shape, Signature, TypeKind,
-    ValueVariant, VarId, VarIndex, VarKind, VarPath, VarPathSelect, VarSelect, Variable,
+    self, Comptime, FuncArg, FuncPath, InstanceKind, IrResult, ModportMemberPath, Shape, Signature,
+    TypeKind, ValueVariant, VarId, VarIndex, VarKind, VarPath, VarPathSelect, VarSelect, Variable,
 };
 use crate::namespace::DefineContext;
 use crate::symbol::{
     ClockDomain, Direction, GenericBoundKind, ProtoBound, Symbol, SymbolKind, TbComponentKind,
 };
-use crate::symbol_path::{GenericSymbolPath, SymbolPathNamespace};
+use crate::symbol_path::{GenericSymbolPath, SymbolPath, SymbolPathNamespace};
 use crate::symbol_table;
 use crate::value::Value;
 use crate::{HashMap, ir_error};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use veryl_parser::resource_table::{self, StrId};
 use veryl_parser::token_range::TokenRange;
@@ -1865,19 +1868,50 @@ impl Conv<&ModportDeclaration> for () {
                 let comptime = Comptime::from_type(r#type, ClockDomain::None, token);
                 c.insert_var_path(path, comptime);
 
-                let mut members = vec![];
-                for x in &x.members {
-                    let symbol = symbol_table::get(*x).unwrap();
-                    match &symbol.kind {
-                        SymbolKind::ModportVariableMember(x) => {
-                            members.push((symbol.token.text, x.direction));
+                let members = if let Some(x) = &value.modport_declaration_opt {
+                    let items: Vec<_> = x.modport_list.as_ref().into();
+                    let mut members = Vec::new();
+                    let mut flat_names = BTreeSet::new();
+                    for item in items {
+                        let member_path = modport_member_path(item.modport_item_path.as_ref());
+                        let direction = item.direction.as_ref().into();
+                        if direction == Direction::Modport {
+                            for member in expand_nested_modport_member(c, &member_path, token)? {
+                                let flat_name = flat_modport_member_name(&member.0);
+                                if !flat_names.insert(flat_name.clone()) {
+                                    invalid_nested_modport(c, &member.0, token);
+                                    continue;
+                                }
+                                members.push(member);
+                            }
+                        } else {
+                            flat_names.insert(flat_modport_member_name(&member_path));
+                            members.push((member_path, direction));
                         }
-                        SymbolKind::ModportFunctionMember(_) => {
-                            members.push((symbol.token.text, Direction::Import));
-                        }
-                        _ => (),
                     }
-                }
+                    members
+                } else {
+                    let mut members = Vec::new();
+                    for member_id in &x.members {
+                        let symbol = symbol_table::get(*member_id).unwrap();
+                        match &symbol.kind {
+                            SymbolKind::ModportVariableMember(x) => {
+                                members.push((
+                                    ModportMemberPath::from_slice(&[symbol.token.text]),
+                                    x.direction,
+                                ));
+                            }
+                            SymbolKind::ModportFunctionMember(_) => {
+                                members.push((
+                                    ModportMemberPath::from_slice(&[symbol.token.text]),
+                                    Direction::Import,
+                                ));
+                            }
+                            _ => (),
+                        }
+                    }
+                    members
+                };
                 c.insert_modport(name, members);
             }
             Ok(())
@@ -1886,4 +1920,231 @@ impl Conv<&ModportDeclaration> for () {
         context.pop_affiliation();
         ret
     }
+}
+
+fn modport_member_path(value: &ModportItemPath) -> ModportMemberPath {
+    ModportMemberPath::new(
+        value.identifier.text(),
+        value
+            .modport_item_path_list
+            .iter()
+            .map(|x| x.identifier.text()),
+    )
+}
+
+fn expand_nested_modport_member(
+    context: &mut Context,
+    member_path: &ModportMemberPath,
+    token: TokenRange,
+) -> IrResult<Vec<(ModportMemberPath, Direction)>> {
+    let Some((&modport_name, instance_path)) = member_path.as_slice().split_last() else {
+        invalid_nested_modport(context, member_path, token);
+        return Ok(Vec::new());
+    };
+    let Some((&root, nested_path)) = instance_path.split_first() else {
+        invalid_nested_modport(context, member_path, token);
+        return Ok(Vec::new());
+    };
+
+    let mut sig = if let Some((_, comptime)) = context.find_path(&VarPath::new(root))
+        && let TypeKind::Instance(sig, InstanceKind::Interface) = &comptime.r#type.kind
+    {
+        if comptime.r#type.array.is_empty() {
+            sig.clone()
+        } else {
+            invalid_nested_modport_array(context, member_path, token);
+            return Ok(Vec::new());
+        }
+    } else {
+        invalid_nested_modport(context, member_path, token);
+        return Ok(Vec::new());
+    };
+
+    for segment in nested_path {
+        let component = get_component(context, &sig, token)?;
+        let ir::Component::Interface(interface) = component.as_ref() else {
+            invalid_nested_modport(context, member_path, token);
+            return Ok(Vec::new());
+        };
+        if interface.has_imports {
+            invalid_nested_modport(context, member_path, token);
+            return Ok(Vec::new());
+        }
+        let path = VarPath::new(*segment);
+        sig = if let Some((_, comptime)) = interface.var_paths.get(&path)
+            && let TypeKind::Instance(sig, InstanceKind::Interface) = &comptime.r#type.kind
+        {
+            if comptime.r#type.array.is_empty() {
+                sig.clone()
+            } else {
+                invalid_nested_modport_array(context, member_path, token);
+                return Ok(Vec::new());
+            }
+        } else {
+            invalid_nested_modport(context, member_path, token);
+            return Ok(Vec::new());
+        };
+    }
+
+    let component = get_component(context, &sig, token)?;
+    let ir::Component::Interface(interface) = component.as_ref() else {
+        invalid_nested_modport(context, member_path, token);
+        return Ok(Vec::new());
+    };
+    if interface.has_imports {
+        invalid_nested_modport(context, member_path, token);
+        return Ok(Vec::new());
+    }
+    let mut members = Vec::new();
+    let modport_members = interface.get_modport(&modport_name);
+    for (path, direction) in &modport_members {
+        if !matches!(
+            direction,
+            Direction::Input | Direction::Output | Direction::Inout
+        ) {
+            invalid_nested_modport(context, member_path, token);
+            return Ok(Vec::new());
+        }
+        if !is_plain_nested_modport_variable(context, interface, path, token)? {
+            invalid_nested_modport(context, member_path, token);
+            return Ok(Vec::new());
+        }
+        let mut terminal_path = instance_path.to_vec();
+        terminal_path.extend(path.as_slice());
+        let member_path = ModportMemberPath::from_slice(&terminal_path);
+        let flat_name = flat_modport_member_name(&member_path);
+        if context
+            .find_path(&VarPath::new(resource_table::insert_str(&flat_name)))
+            .is_some()
+        {
+            invalid_nested_modport(context, &member_path, token);
+            continue;
+        }
+        if let Some(existing_path) = context.nested_modport_flat_name(&flat_name) {
+            if existing_path != &member_path {
+                invalid_nested_modport(context, &member_path, token);
+                continue;
+            }
+        } else {
+            context.insert_nested_modport_flat_name(flat_name, member_path.clone());
+        }
+        members.push((member_path, *direction));
+    }
+    members.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if members.is_empty() {
+        invalid_nested_modport(context, member_path, token);
+        Ok(Vec::new())
+    } else if has_referenced_unforwarded_child_member(interface, &sig, &modport_members) {
+        invalid_nested_modport(context, member_path, token);
+        Ok(Vec::new())
+    } else {
+        Ok(members)
+    }
+}
+
+fn is_plain_nested_modport_variable(
+    context: &mut Context,
+    interface: &ir::Interface,
+    path: &ModportMemberPath,
+    token: TokenRange,
+) -> IrResult<bool> {
+    let Some((&head, tail)) = path.as_slice().split_first() else {
+        return Ok(false);
+    };
+
+    if let Some((_, comptime)) = interface.var_paths.get(&VarPath::new(head))
+        && let TypeKind::Instance(sig, InstanceKind::Interface) = &comptime.r#type.kind
+    {
+        if !comptime.r#type.array.is_empty() || tail.is_empty() {
+            return Ok(false);
+        }
+
+        let component = get_component(context, sig, token)?;
+        let ir::Component::Interface(interface) = component.as_ref() else {
+            return Ok(false);
+        };
+        return is_plain_nested_modport_variable(
+            context,
+            interface,
+            &ModportMemberPath::from_slice(tail),
+            token,
+        );
+    }
+
+    Ok(interface.variables.values().any(|variable| {
+        variable.kind == VarKind::Variable
+            && path.as_slice().starts_with(variable.path.0.as_slice())
+    }))
+}
+
+fn has_referenced_unforwarded_child_member(
+    interface: &ir::Interface,
+    sig: &Signature,
+    modport_members: &HashMap<ModportMemberPath, Direction>,
+) -> bool {
+    let Some(interface_symbol) = symbol_table::get(sig.symbol) else {
+        return false;
+    };
+    let namespace = interface_symbol.inner_namespace();
+
+    let referenced_unforwarded_variable = interface.variables.values().any(|variable| {
+        matches!(
+            variable.kind,
+            VarKind::Input | VarKind::Output | VarKind::Inout | VarKind::Variable | VarKind::Let
+        ) && !modport_members
+            .keys()
+            .any(|path| path.as_slice() == variable.path.0.as_slice())
+            && has_references(&variable.path.0, &namespace)
+    });
+    let referenced_function = interface
+        .functions
+        .values()
+        .any(|function| has_reference_id(function.path.sig.symbol));
+
+    referenced_unforwarded_variable || referenced_function
+}
+
+fn has_references(path: &[StrId], namespace: &crate::namespace::Namespace) -> bool {
+    let symbol_path = SymbolPath::new(path);
+    let Ok(symbol) = symbol_table::resolve((&symbol_path, namespace)) else {
+        return false;
+    };
+    has_reference_id(symbol.found.id)
+}
+
+fn has_reference_id(id: crate::symbol::SymbolId) -> bool {
+    symbol_table::get_references(id).is_some_and(|tokens| !tokens.is_empty())
+}
+
+fn flat_modport_member_name(path: &ModportMemberPath) -> String {
+    path.as_slice()
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("__")
+}
+
+fn invalid_nested_modport(
+    context: &mut Context,
+    member_path: &ModportMemberPath,
+    token: TokenRange,
+) {
+    context.insert_error(AnalyzerError::invalid_modport_item(
+        InvalidModportItemKind::Modport,
+        &member_path.to_string(),
+        &token,
+    ));
+}
+
+fn invalid_nested_modport_array(
+    context: &mut Context,
+    member_path: &ModportMemberPath,
+    token: TokenRange,
+) {
+    context.insert_error(AnalyzerError::invalid_modport_item(
+        InvalidModportItemKind::ArrayedInterface,
+        &member_path.to_string(),
+        &token,
+    ));
 }

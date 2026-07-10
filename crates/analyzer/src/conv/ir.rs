@@ -336,21 +336,25 @@ impl Conv<&InterfaceDeclaration> for ir::Interface {
             }
         }
 
-        for x in &value.interface_declaration_list {
-            let items: Vec<_> = x.interface_group.as_ref().into();
-            for item in items {
-                match item {
-                    InterfaceItem::GenerateItem(x) => {
-                        let _: IrResult<ir::DeclarationBlock> =
-                            Conv::conv(&mut context, x.generate_item.as_ref());
-                    }
-                    InterfaceItem::ModportDeclaration(x) => {
-                        let _: IrResult<()> =
-                            Conv::conv(&mut context, x.modport_declaration.as_ref());
+        context.with_nested_modport_flat_name_scope(|context| {
+            for x in &value.interface_declaration_list {
+                let items: Vec<_> = x.interface_group.as_ref().into();
+                for item in items {
+                    match item {
+                        InterfaceItem::GenerateItem(x) => {
+                            let _: IrResult<ir::DeclarationBlock> =
+                                Conv::conv(context, x.generate_item.as_ref());
+                        }
+                        InterfaceItem::ModportDeclaration(x) => {
+                            let _: IrResult<()> =
+                                Conv::conv(context, x.modport_declaration.as_ref());
+                        }
                     }
                 }
             }
-        }
+
+            Ok(())
+        })?;
 
         let var_paths = context.drain_var_paths();
         let func_paths = context.drain_func_paths();
@@ -367,6 +371,7 @@ impl Conv<&InterfaceDeclaration> for ir::Interface {
 
         Ok(ir::Interface {
             name: value.identifier.text(),
+            has_imports: !value.collect_import_declarations().is_empty(),
             var_paths,
             func_paths,
             variables,

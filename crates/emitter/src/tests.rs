@@ -1310,6 +1310,236 @@ endmodule
 }
 
 #[test]
+fn emit_nested_interface_modport_forwarding() {
+    let code = r#"interface CpuIf {
+    var fatal: logic;
+    var mask : logic;
+
+    modport sink {
+        fatal: input ,
+        mask : input ,
+    }
+
+    modport source {
+        fatal: output,
+        mask : output,
+    }
+}
+
+interface IrqIf {
+    inst cpu: CpuIf;
+    let seen: logic = cpu.fatal;
+
+    modport sink {
+        cpu.sink: modport,
+    }
+
+    modport source {
+        cpu.source: modport,
+    }
+}
+
+module Cpu (
+    irq: modport IrqIf::sink,
+) {
+    let fatal_seen: logic = irq.cpu.fatal;
+}
+"#;
+
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let ret = emit(&metadata, code);
+    println!("{ret}");
+
+    assert!(ret.contains("logic cpu__fatal;"));
+    assert!(ret.contains("logic cpu__mask ;"));
+    assert!(ret.contains("input cpu__fatal"));
+    assert!(ret.contains("input cpu__mask"));
+    assert!(ret.contains("output cpu__fatal"));
+    assert!(ret.contains("output cpu__mask"));
+    assert!(ret.contains("seen = cpu__fatal;"));
+    assert!(!ret.contains("seen = cpu.fatal;"));
+    assert!(ret.contains("fatal_seen = irq.cpu__fatal;"));
+
+    let irq_if = ret
+        .split("interface prj_IrqIf;")
+        .nth(1)
+        .and_then(|x| x.split("endinterface").next())
+        .expect("emitted IrqIf interface");
+    assert!(!irq_if.contains("prj_CpuIf cpu"));
+}
+
+#[test]
+fn emit_nested_interface_modport_forwarding_preserves_signal_selects() {
+    let code = r#"interface CpuIf {
+    var data: logic [2];
+
+    modport sink {
+        data: input,
+    }
+}
+
+interface IrqIf {
+    inst cpu: CpuIf;
+    let seen: logic = cpu.data[0];
+
+    modport sink {
+        cpu.sink: modport,
+    }
+}
+
+module Cpu (
+    irq: modport IrqIf::sink,
+) {
+    let data_seen: logic = irq.cpu.data[0];
+}
+"#;
+
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let ret = emit(&metadata, code);
+    println!("{ret}");
+
+    assert!(ret.contains("logic cpu__data [2];"));
+    assert!(ret.contains("seen = cpu__data[0];"));
+    assert!(ret.contains("data_seen = irq.cpu__data[0];"));
+    assert!(!ret.contains("cpu.data[0]"));
+    assert!(!ret.contains("irq.cpu.data[0]"));
+}
+
+#[test]
+fn emit_modport_struct_member_access_preserves_dots() {
+    let code = r#"package PayloadPkg {
+    struct Payload {
+        b: logic,
+    }
+}
+
+interface PlainIf {
+    var payload: PayloadPkg::Payload;
+
+    modport sink {
+        payload: input,
+    }
+}
+
+module PlainConsumer (
+    p: modport PlainIf::sink,
+) {
+    let seen: logic = p.payload.b;
+}
+"#;
+
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let ret = emit(&metadata, code);
+    println!("{ret}");
+
+    assert!(ret.contains("seen = p.payload.b;"));
+    assert!(!ret.contains("p.payload__b"));
+    assert!(!ret.contains("payload__b"));
+}
+
+#[test]
+fn emit_nested_interface_modport_forwarding_flattens_aggregate_suffix() {
+    let code = r#"package PayloadPkg {
+    struct Payload {
+        b: logic,
+    }
+}
+
+interface ChildIf {
+    var payload: PayloadPkg::Payload;
+
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf {
+    inst child: ChildIf;
+
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+module Consumer (
+    p: modport ParentIf::sink,
+) {
+    let seen: logic = p.child.payload.b;
+}
+"#;
+
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let ret = emit(&metadata, code);
+    println!("{ret}");
+
+    assert!(ret.contains("child__payload"));
+    assert!(ret.contains("seen = p.child__payload.b;"));
+    assert!(!ret.contains("p.child.payload.b"));
+}
+
+#[test]
+fn emit_recursive_nested_interface_modport_forwarding() {
+    let code = r#"interface SubIf {
+    var fatal: logic;
+
+    modport sink {
+        fatal: input,
+    }
+}
+
+interface CpuIf {
+    inst sub: SubIf;
+
+    modport deep {
+        sub.sink: modport,
+    }
+}
+
+interface IrqIf {
+    inst cpu: CpuIf;
+    inst aux: SubIf;
+    let seen: logic = cpu.sub.fatal;
+
+    modport sink {
+        aux.sink: modport,
+    }
+
+    modport deep {
+        cpu.deep: modport,
+    }
+}
+
+module Cpu (
+    irq: modport IrqIf::deep,
+) {
+    let fatal_seen: logic = irq.cpu.sub.fatal;
+}
+"#;
+
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let ret = emit(&metadata, code);
+    println!("{ret}");
+
+    assert!(ret.contains("logic cpu__sub__fatal;"));
+    assert!(ret.contains("input cpu__sub__fatal"));
+    assert!(ret.contains("seen = cpu__sub__fatal;"));
+    assert!(ret.contains("fatal_seen = irq.cpu__sub__fatal;"));
+    assert!(!ret.contains("cpu.deep"));
+
+    let irq_if = ret
+        .split("interface prj_IrqIf;")
+        .nth(1)
+        .and_then(|x| x.split("endinterface").next())
+        .expect("emitted IrqIf interface");
+    assert!(!irq_if.contains("prj_CpuIf cpu"));
+}
+
+#[test]
 fn expand_modport() {
     let code = r#"
 proto package ProtoPkgA {

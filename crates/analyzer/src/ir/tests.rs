@@ -1,5 +1,8 @@
+use crate::analyzer_error::AnalyzerError;
 use crate::conv::Context;
-use crate::ir::Ir;
+use crate::conv::utils::get_component;
+use crate::ir::{Component, Ir, Signature};
+use crate::symbol::{Direction, SymbolKind};
 use crate::{Analyzer, attribute_table, symbol_table};
 use similar::{ChangeTag, TextDiff};
 use veryl_metadata::Metadata;
@@ -886,6 +889,140 @@ module ModuleB {
 "#;
 
     check_ir(code, exp);
+}
+
+#[test]
+fn nested_modport_forwarding_ir() {
+    let code = r#"
+    interface CpuIf {
+        var fatal: logic;
+        var mask: logic;
+        modport sink {
+            fatal: input,
+            mask: input,
+        }
+        modport source {
+            fatal: output,
+            mask: output,
+        }
+    }
+    interface ClusterIf {
+        inst cpu: CpuIf;
+        modport sink {
+            cpu.sink: modport,
+        }
+    }
+    interface IrqIf {
+        inst cpu: CpuIf;
+        inst aux: CpuIf;
+        inst cluster: ClusterIf;
+        modport sink {
+            cpu.sink: modport,
+            aux.sink: modport,
+            cluster.cpu.sink: modport,
+        }
+        modport source {
+            cpu.source: modport,
+            aux.source: modport,
+        }
+    }
+    module Top {
+        inst irq: IrqIf;
+    }
+    "#;
+
+    symbol_table::clear();
+    attribute_table::clear();
+
+    let metadata = Metadata::create_default("prj").unwrap();
+    let parser = Parser::parse(code, &"").unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+
+    let mut errors = vec![];
+    errors.append(&mut analyzer.analyze_pass1("prj", &parser.veryl));
+    errors.append(&mut Analyzer::analyze_post_pass1());
+    errors.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error, AnalyzerError::UnassignVariable { .. })),
+        "{errors:?}"
+    );
+
+    let irq_if = resource_table::insert_str("IrqIf");
+    let symbol = symbol_table::get_all()
+        .into_iter()
+        .find(|symbol| {
+            symbol.token.text == irq_if && matches!(symbol.kind, SymbolKind::Interface(_))
+        })
+        .unwrap();
+    let component = get_component(
+        &mut context,
+        &Signature::new(symbol.id),
+        symbol.token.into(),
+    )
+    .unwrap();
+    let Component::Interface(interface) = component.as_ref() else {
+        panic!("expected IrqIf interface component");
+    };
+
+    let mut variables: Vec<_> = interface
+        .variables
+        .values()
+        .map(|variable| variable.path.to_string())
+        .collect();
+    variables.sort();
+    assert_eq!(
+        variables,
+        vec![
+            "aux.fatal".to_string(),
+            "aux.mask".to_string(),
+            "cluster.cpu.fatal".to_string(),
+            "cluster.cpu.mask".to_string(),
+            "cpu.fatal".to_string(),
+            "cpu.mask".to_string(),
+        ]
+    );
+
+    let mut sink: Vec<_> = interface
+        .modports
+        .get(&resource_table::insert_str("sink"))
+        .unwrap()
+        .iter()
+        .map(|(path, direction)| (path.to_string(), *direction))
+        .collect();
+    sink.sort();
+    assert_eq!(
+        sink,
+        vec![
+            ("aux.fatal".to_string(), Direction::Input),
+            ("aux.mask".to_string(), Direction::Input),
+            ("cluster.cpu.fatal".to_string(), Direction::Input),
+            ("cluster.cpu.mask".to_string(), Direction::Input),
+            ("cpu.fatal".to_string(), Direction::Input),
+            ("cpu.mask".to_string(), Direction::Input),
+        ]
+    );
+
+    let mut source: Vec<_> = interface
+        .modports
+        .get(&resource_table::insert_str("source"))
+        .unwrap()
+        .iter()
+        .map(|(path, direction)| (path.to_string(), *direction))
+        .collect();
+    source.sort();
+    assert_eq!(
+        source,
+        vec![
+            ("aux.fatal".to_string(), Direction::Output),
+            ("aux.mask".to_string(), Direction::Output),
+            ("cpu.fatal".to_string(), Direction::Output),
+            ("cpu.mask".to_string(), Direction::Output),
+        ]
+    );
 }
 
 #[test]

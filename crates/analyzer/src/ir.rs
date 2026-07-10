@@ -29,7 +29,7 @@ pub use declaration::{
 pub use expression::{ArrayLiteralItem, Expression, Factor, HierVarRef};
 pub use ff_table::FfTable;
 pub use function::{Arguments, FuncArg, FuncPath, FuncProto, Function, FunctionBody, FunctionCall};
-pub use interface::Interface;
+pub use interface::{Interface, ModportMemberPath};
 pub use ir::{Component, Ir, IrError, IrResult, SystemVerilog};
 pub use module::Module;
 pub use op::Op;

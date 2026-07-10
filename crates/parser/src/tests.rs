@@ -167,6 +167,65 @@ fn identifier() {
 }
 
 #[test]
+fn direct_modport_item() {
+    let code = r#"
+interface If {
+    var fatal: logic;
+    modport sink {
+        fatal: input,
+    }
+}
+"#;
+
+    let parser = Parser::parse(code, &"");
+    assert!(parser.is_ok(), "{:?}", parser.err());
+}
+
+#[test]
+fn nested_modport_item_path() {
+    let code = r#"
+interface CpuIf {
+    var fatal: logic;
+    modport sink {
+        fatal: input,
+    }
+}
+
+interface IrqIf {
+    inst cpu: CpuIf;
+    modport sink {
+        cpu.sink: modport,
+    }
+}
+"#;
+
+    let parser = Parser::parse(code, &"");
+    assert!(parser.is_ok(), "{:?}", parser.err());
+}
+
+#[test]
+fn nested_modport_item_rejects_array_path() {
+    let code = r#"
+interface CpuIf {
+    var fatal: logic;
+    modport sink {
+        fatal: input,
+    }
+}
+
+interface IrqIf {
+    inst cpu: CpuIf[2];
+    modport sink {
+        cpu[0].sink: modport,
+    }
+}
+"#;
+
+    let parser = Parser::parse(code, &"");
+    assert!(parser.is_err());
+}
+
+#[test]
 fn expression() {
     success("let a: u32 = 1 && 1 || 1 & 1 ^ 1 ~^ 1 ^~ 1 | 1;");
     success("let a: u32 = 1 <: 1 <= 1 >: 1 >= 1 == 1 != 1 ==? 1 !=? 1;");

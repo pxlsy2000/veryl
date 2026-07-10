@@ -83,7 +83,8 @@ pub fn check_direction(context: &mut Context, value: &Direction) {
         Direction::Modport(x) => {
             let valid = context.is_affiliated(Affiliation::Module)
                 | context.is_affiliated(Affiliation::Function)
-                | context.is_affiliated(Affiliation::ProtoModule);
+                | context.is_affiliated(Affiliation::ProtoModule)
+                | context.is_affiliated(Affiliation::Modport);
             if !valid {
                 context.insert_error(AnalyzerError::invalid_direction(
                     "modport",
