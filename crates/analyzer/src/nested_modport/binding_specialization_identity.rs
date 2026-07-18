@@ -9,7 +9,7 @@ pub(crate) struct BindingSpecializationIdentity {
     ordinal: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct BindingSpecializationInterner<S = std::hash::RandomState> {
     identities: HashMap<Arc<NestedModportLoweringKey>, BindingSpecializationIdentity, S>,
     next_ordinal: usize,

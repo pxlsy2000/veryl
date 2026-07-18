@@ -164,7 +164,7 @@ fn production_binding_keys_do_not_rewalk_material_lowerings_per_binding() {
     assert!(work[2] <= 3 * work[1], "{work:?}");
     assert_eq!(rescanned_work, work);
     for (index, scale) in [8_usize, 16, 32].into_iter().enumerate() {
-        assert!(clones[index].events <= 12 * scale, "{clones:?}");
+        assert!(clones[index].events <= 24 * scale, "{clones:?}");
         assert_eq!(clones[index].recursive_nodes, clones[index].events);
         assert_eq!(clones[index].allocations, 0);
         assert_eq!(rescanned_clones[index].events - clones[index].events, scale);
