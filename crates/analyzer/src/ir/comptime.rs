@@ -11,6 +11,7 @@ use crate::symbol::ClockDomain;
 use crate::symbol::{Direction, SymbolId};
 use crate::value::Value;
 use std::fmt;
+use std::sync::Arc;
 use veryl_parser::resource_table::StrId;
 use veryl_parser::token_range::TokenRange;
 
@@ -392,9 +393,50 @@ pub struct Type {
     width: Shape,
     width_expr: Vec<crate::ir::WidthExpr>,
     array_expr: Vec<crate::ir::WidthExpr>,
+    named_resolution: Option<Arc<NamedTypeResolution>>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct NamedTypeResolution {
+    path: crate::symbol_path::GenericSymbolPath,
+    generic_context: Vec<(
+        veryl_parser::resource_table::StrId,
+        crate::symbol_path::GenericSymbolPath,
+    )>,
 }
 
 impl Type {
+    #[cfg(test)]
+    pub(crate) fn clone_with_nested_modport_work(&self) -> (Self, usize, usize) {
+        let array = self.array.clone();
+        let width = self.width.clone();
+        let width_expr = self.width_expr.clone();
+        let array_expr = self.array_expr.clone();
+        let nodes = 1
+            + self.array.as_slice().len()
+            + self.width.as_slice().len()
+            + self.width_expr.len()
+            + self.array_expr.len();
+        let allocations = usize::from(!self.array.is_empty())
+            + usize::from(!self.width.is_empty())
+            + usize::from(!self.width_expr.is_empty())
+            + usize::from(!self.array_expr.is_empty());
+        (
+            Self {
+                kind: self.kind.clone(),
+                signed: self.signed,
+                is_positive: self.is_positive,
+                array,
+                width,
+                width_expr,
+                array_expr,
+                named_resolution: self.named_resolution.clone(),
+            },
+            nodes,
+            allocations,
+        )
+    }
+
     pub fn width(&self) -> &Shape {
         &self.width
     }
@@ -413,6 +455,52 @@ impl Type {
 
     pub fn set_array_expr(&mut self, exprs: Vec<crate::ir::WidthExpr>) {
         self.array_expr = exprs;
+    }
+
+    pub(crate) fn named_path(&self) -> Option<&crate::symbol_path::GenericSymbolPath> {
+        self.named_resolution
+            .as_ref()
+            .map(|resolution| &resolution.path)
+    }
+
+    pub(crate) fn set_named_path(&mut self, path: crate::symbol_path::GenericSymbolPath) {
+        let generic_context = self
+            .named_resolution
+            .as_ref()
+            .map(|resolution| resolution.generic_context.clone())
+            .unwrap_or_default();
+        self.named_resolution = Some(Arc::new(NamedTypeResolution {
+            path,
+            generic_context,
+        }));
+    }
+
+    pub(crate) fn named_generic_context(
+        &self,
+    ) -> &[(
+        veryl_parser::resource_table::StrId,
+        crate::symbol_path::GenericSymbolPath,
+    )] {
+        self.named_resolution
+            .as_ref()
+            .map(|resolution| resolution.generic_context.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_named_generic_context(
+        &mut self,
+        mut context: Vec<(
+            veryl_parser::resource_table::StrId,
+            crate::symbol_path::GenericSymbolPath,
+        )>,
+    ) {
+        context.sort_by_key(|(name, _)| *name);
+        if let Some(path) = self.named_path().cloned() {
+            self.named_resolution = Some(Arc::new(NamedTypeResolution {
+                path,
+                generic_context: context,
+            }));
+        }
     }
 
     pub fn new(kind: TypeKind) -> Type {
@@ -709,10 +797,11 @@ impl Type {
 
                 let mut temp = vec![];
                 for (id, variable) in &component.variables {
-                    if modport_members
-                        .keys()
-                        .any(|path| path.strip_prefix(&variable.path.0).is_some())
-                    {
+                    if modport_members.is_some_and(|members| {
+                        members
+                            .iter_paths_directions()
+                            .any(|(path, _)| path.strip_prefix(&variable.path.0).is_some())
+                    }) {
                         let mut member_path = variable.path.clone();
                         member_path.add_prelude(&path.0);
                         temp.push((id, member_path, variable.r#type.clone()));
@@ -757,8 +846,12 @@ impl Type {
 
             let mut temp = vec![];
             for (id, variable) in &component.variables {
-                if let Some(x) = modport_members.iter().find_map(|(path, direction)| {
-                    path.strip_prefix(&variable.path.0).map(|_| direction)
+                if let Some(x) = modport_members.and_then(|members| {
+                    members
+                        .iter_paths_directions()
+                        .find_map(|(path, direction)| {
+                            path.strip_prefix(&variable.path.0).map(|_| direction)
+                        })
                 }) {
                     let mut member_path = variable.path.clone();
                     member_path.add_prelude(&path.0);

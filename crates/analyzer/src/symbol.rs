@@ -344,6 +344,53 @@ impl Symbol {
         ret
     }
 
+    pub(crate) fn introduces_emitted_identifier_in_owner_scope(
+        &self,
+        owner_scope: ScopeId,
+        owner_namespace: &Namespace,
+    ) -> bool {
+        match &self.kind {
+            SymbolKind::Port(_)
+            | SymbolKind::Variable(_)
+            | SymbolKind::Function(_)
+            | SymbolKind::Parameter(_)
+            | SymbolKind::Instance(_)
+            | SymbolKind::Block
+            | SymbolKind::Struct(_)
+            | SymbolKind::Union(_)
+            | SymbolKind::TypeDef(_)
+            | SymbolKind::Enum(_)
+            | SymbolKind::GenericParameter(_)
+            | SymbolKind::GenericConst(_) => self.namespace == *owner_namespace,
+            SymbolKind::Genvar => {
+                self.namespace.define_context == owner_namespace.define_context
+                    && scope::parent(self.scope) == Some(owner_scope)
+            }
+            SymbolKind::Module(_)
+            | SymbolKind::AliasModule(_)
+            | SymbolKind::Interface(_)
+            | SymbolKind::AliasInterface(_)
+            | SymbolKind::Package(_)
+            | SymbolKind::AliasPackage(_)
+            | SymbolKind::StructMember(_)
+            | SymbolKind::UnionMember(_)
+            | SymbolKind::EnumMember(_)
+            | SymbolKind::EnumMemberMangled
+            | SymbolKind::Modport(_)
+            | SymbolKind::ModportVariableMember(_)
+            | SymbolKind::ModportFunctionMember(_)
+            | SymbolKind::SystemVerilog
+            | SymbolKind::Namespace
+            | SymbolKind::SystemFunction(_)
+            | SymbolKind::GenericInstance(_)
+            | SymbolKind::ClockDomain
+            | SymbolKind::Test(_)
+            | SymbolKind::Embed
+            | SymbolKind::TbComponent(_)
+            | SymbolKind::ProjectProperty(_) => false,
+        }
+    }
+
     pub fn generic_maps(&self) -> Vec<GenericMap> {
         let mut ret = Vec::new();
 
@@ -1667,6 +1714,8 @@ impl Type {
             &self.kind,
             TypeKind::P8 | TypeKind::P16 | TypeKind::P32 | TypeKind::P64
         );
+        let mut named_path = None;
+        let mut named_generic_context = Vec::new();
 
         let kind = match &self.kind {
             TypeKind::Clock => ir::TypeKind::Clock,
@@ -1698,6 +1747,8 @@ impl Type {
             TypeKind::String => ir::TypeKind::String,
             TypeKind::UserDefined(x) => {
                 let mut r#type = eval_type(context, &x.path, pos)?;
+                named_path = r#type.named_path().cloned();
+                named_generic_context = r#type.named_generic_context().to_vec();
 
                 width.append(r#type.width_mut());
                 array.append(&mut r#type.array);
@@ -1712,6 +1763,10 @@ impl Type {
 
         let width_expr = build_width_expr(&self.width, &width);
         let mut r#type = ir::Type::new(kind);
+        if let Some(path) = named_path {
+            r#type.set_named_path(path);
+            r#type.set_named_generic_context(named_generic_context);
+        }
         r#type.signed = signed;
         r#type.is_positive = is_positive;
         // Inner typedef/user-defined dims were appended after this type's

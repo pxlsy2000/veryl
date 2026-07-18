@@ -1,0 +1,7 @@
+[project]
+name = "package_function_combined"
+version = "0.1.0"
+
+[build]
+sources = ["src"]
+target = { type = "source" }

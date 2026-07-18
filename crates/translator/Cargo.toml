@@ -12,7 +12,7 @@ edition.workspace     = true
 
 [dependencies]
 miette          = {workspace = true}
-sv-parser       = "0.13"
+sv-parser       = {workspace = true}
 thiserror       = {workspace = true}
 veryl-formatter = {version = "0.20.2", path = "../formatter"}
 veryl-metadata  = {version = "0.20.2", path = "../metadata"}

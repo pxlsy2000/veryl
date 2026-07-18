@@ -1,6 +1,7 @@
 use crate::HashMap;
 use crate::conv::context::Config;
 use crate::ir::{Component, Signature};
+use crate::nested_modport::ComponentCacheKey;
 use std::sync::Arc;
 
 #[derive(Clone, Default)]
@@ -8,22 +9,22 @@ pub struct InstanceHistory {
     pub hierarchy: Vec<Signature>,
     /// `Arc`-wrapped so repeated `get` hands out references instead of
     /// deep-cloning the component tree — matters on testbench-heavy designs.
-    full: HashMap<Signature, Option<(Arc<Component>, bool)>>,
+    full: HashMap<ComponentCacheKey, Option<(Arc<Component>, bool)>>,
 }
 
 impl InstanceHistory {
-    pub fn get(&self, sig: &Signature) -> Option<(Arc<Component>, bool)> {
-        self.full.get(sig).cloned().flatten()
+    pub fn get(&self, key: &ComponentCacheKey) -> Option<(Arc<Component>, bool)> {
+        self.full.get(key).cloned().flatten()
     }
 
-    pub fn set(&mut self, sig: &Signature, component: Arc<Component>, in_generic: bool) {
-        if let Some(x) = self.full.get_mut(sig) {
+    pub fn set(&mut self, key: &ComponentCacheKey, component: Arc<Component>, in_generic: bool) {
+        if let Some(x) = self.full.get_mut(key) {
             *x = Some((component, in_generic));
         }
     }
 
-    pub fn remove(&mut self, sig: &Signature) {
-        self.full.remove(sig);
+    pub fn remove(&mut self, key: &ComponentCacheKey) {
+        self.full.remove(key);
     }
 
     pub fn get_current_signature(&self) -> Option<&Signature> {
@@ -33,6 +34,7 @@ impl InstanceHistory {
     pub fn push(
         &mut self,
         mut sig: Signature,
+        key: ComponentCacheKey,
         config: &Config,
     ) -> Result<bool, InstanceHistoryError> {
         sig.normalize();
@@ -45,11 +47,11 @@ impl InstanceHistory {
         if self.hierarchy.contains(&sig) {
             return Err(InstanceHistoryError::InfiniteRecursion);
         }
-        if self.full.contains_key(&sig) {
+        if self.full.contains_key(&key) {
             Ok(false)
         } else {
-            self.hierarchy.push(sig.clone());
-            self.full.insert(sig, None);
+            self.hierarchy.push(sig);
+            self.full.insert(key, None);
             Ok(true)
         }
     }
@@ -58,13 +60,21 @@ impl InstanceHistory {
         self.hierarchy.pop();
     }
 
+    pub fn clear_hierarchy(&mut self) {
+        self.hierarchy.clear();
+    }
+
     pub fn clear(&mut self) {
         self.hierarchy.clear();
         self.full.clear();
     }
 }
 
-#[derive(Debug)]
+#[cfg(test)]
+#[path = "instance_test.rs"]
+mod tests;
+
+#[derive(Debug, Eq, PartialEq)]
 pub enum InstanceHistoryError {
     ExceedDepthLimit(usize),
     ExceedTotalLimit(usize),

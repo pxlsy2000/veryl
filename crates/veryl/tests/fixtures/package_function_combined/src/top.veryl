@@ -1,0 +1,29 @@
+interface ChildIf::<W: u32> {
+    var payload: logic<W>;
+    modport sink { payload: input, }
+}
+
+interface ParentIf::<W: u32> {
+    inst child: ChildIf::<W>;
+    modport sink { child.sink: modport, }
+}
+
+package Combo::<PW: u32> {
+    type PackageData = logic<PW>;
+    function consume::<FW: u32> (
+        p: modport ParentIf::<FW>::sink,
+    ) -> logic<FW> {
+        return p.child.payload;
+    }
+}
+
+module Top {
+    #[allow(unassign_variable)]
+    inst parent8 : ParentIf::<8>;
+    #[allow(unassign_variable)]
+    inst parent16: ParentIf::<16>;
+    let _force8 : Combo::<8>::PackageData = 0;
+    let _force16: Combo::<16>::PackageData = 0;
+    let _observed8 : logic<8>  = Combo::<8>::consume::<8>(parent8);
+    let _observed16: logic<16> = Combo::<16>::consume::<16>(parent16);
+}

@@ -16,6 +16,7 @@ pub mod literal_table;
 pub mod msb_table;
 pub mod multi_sources;
 pub mod namespace;
+pub mod nested_modport;
 pub mod range_table;
 pub mod reference_table;
 pub mod resolved_type_table;
@@ -34,6 +35,10 @@ pub mod wavedrom;
 pub use analyzer::Analyzer;
 pub use analyzer_error::{AnalyzerError, CachedDiagnostic};
 pub use conv::Context;
+#[cfg(test)]
+mod nested_modport_tests;
+#[cfg(test)]
+mod nested_modport_unlowered_reference_tests;
 #[cfg(test)]
 mod tests;
 

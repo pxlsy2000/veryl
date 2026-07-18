@@ -1,4 +1,5 @@
 use crate::multi_sources::{MultiSources, Source};
+use crate::nested_modport::{NestedModportAnalysisInvariant, NestedModportFinalizeError};
 use miette::{self, Diagnostic, Severity, SourceSpan};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -536,6 +537,33 @@ pub enum AnalyzerError {
         input: MultiSources,
         #[label("Error location")]
         error_location: SourceSpan,
+        token_source: TokenSource,
+    },
+
+    #[diagnostic(
+        severity(Error),
+        code(invalid_nested_modport),
+        help(""),
+        url("https://doc.veryl-lang.org/book/07_appendix/02_semantic_error.html#{}", self.code().unwrap())
+    )]
+    #[error("cannot lower nested modport \"{path}\": {kind}")]
+    InvalidNestedModport {
+        path: String,
+        kind: InvalidNestedModportKind,
+        #[source_code]
+        input: MultiSources,
+        #[label("nested modport lowering failure")]
+        error_location: SourceSpan,
+        #[label(collection, "first conflicting item")]
+        first_conflict_location: Vec<SourceSpan>,
+        token_source: TokenSource,
+    },
+
+    #[diagnostic(severity(Error), code(nested_modport_analysis_invariant), help(""))]
+    #[error("nested modport analysis invariant: {kind}")]
+    NestedModportAnalysisInvariant {
+        kind: NestedModportAnalysisInvariant,
+        input: MultiSources,
         token_source: TokenSource,
     },
 
@@ -1796,6 +1824,43 @@ pub enum AnalyzerError {
     },
 }
 
+impl From<NestedModportAnalysisInvariant> for AnalyzerError {
+    fn from(kind: NestedModportAnalysisInvariant) -> Self {
+        Self::NestedModportAnalysisInvariant {
+            kind,
+            input: MultiSources { sources: vec![] },
+            token_source: TokenSource::Builtin,
+        }
+    }
+}
+
+impl From<NestedModportFinalizeError> for AnalyzerError {
+    fn from(error: NestedModportFinalizeError) -> Self {
+        match error {
+            NestedModportFinalizeError::Invariant(kind) => kind.into(),
+            NestedModportFinalizeError::UnloweredLocalReference {
+                semantic_segments,
+                occurrence,
+            } => {
+                let path = semantic_segments
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(".");
+                Self::invalid_nested_modport(
+                    &path,
+                    InvalidNestedModportKind::UnloweredLocalReference { path: path.clone() },
+                    &NestedModportDiagnosticSite {
+                        item_path: occurrence,
+                        offending: occurrence,
+                        first_conflict: None,
+                    },
+                )
+            }
+        }
+    }
+}
+
 fn source(token: &TokenRange) -> MultiSources {
     let path = token.beg.source.to_string();
     let text = token.beg.source.get_text();
@@ -2005,6 +2070,8 @@ impl AnalyzerError {
             AnalyzerError::InvalidLsb { input, .. } => input,
             AnalyzerError::InvalidModifier { input, .. } => input,
             AnalyzerError::InvalidModportItem { input, .. } => input,
+            AnalyzerError::InvalidNestedModport { input, .. } => input,
+            AnalyzerError::NestedModportAnalysisInvariant { input, .. } => input,
             AnalyzerError::InvalidMsb { input, .. } => input,
             AnalyzerError::InvalidNumberCharacter { input, .. } => input,
             AnalyzerError::InvalidOperand { input, .. } => input,
@@ -2115,6 +2182,8 @@ impl AnalyzerError {
             AnalyzerError::InvalidLsb { token_source, .. } => *token_source,
             AnalyzerError::InvalidModifier { token_source, .. } => *token_source,
             AnalyzerError::InvalidModportItem { token_source, .. } => *token_source,
+            AnalyzerError::InvalidNestedModport { token_source, .. } => *token_source,
+            AnalyzerError::NestedModportAnalysisInvariant { token_source, .. } => *token_source,
             AnalyzerError::InvalidMsb { token_source, .. } => *token_source,
             AnalyzerError::InvalidNumberCharacter { token_source, .. } => *token_source,
             AnalyzerError::InvalidOperand { token_source, .. } => *token_source,
@@ -2491,6 +2560,51 @@ impl AnalyzerError {
             input: source(token),
             error_location: token.into(),
             token_source: token.source(),
+        }
+    }
+    pub fn invalid_nested_modport(
+        path: &str,
+        kind: InvalidNestedModportKind,
+        site: &NestedModportDiagnosticSite,
+    ) -> Self {
+        let primary = match &kind {
+            InvalidNestedModportKind::EmptyModport { .. }
+            | InvalidNestedModportKind::FlatNameCollision { .. }
+            | InvalidNestedModportKind::UnloweredLocalReference { .. } => site.item_path,
+            InvalidNestedModportKind::UnsupportedMemberDirection { .. }
+            | InvalidNestedModportKind::NonVariableTerminal { .. }
+            | InvalidNestedModportKind::UnemittableTerminalType { .. }
+                if site.offending.source() != site.item_path.source() =>
+            {
+                site.item_path
+            }
+            InvalidNestedModportKind::MissingInterfaceSegment { .. }
+            | InvalidNestedModportKind::NonInterfaceSegment { .. }
+            | InvalidNestedModportKind::ArrayedInterfaceSegment { .. }
+            | InvalidNestedModportKind::MissingModport { .. }
+            | InvalidNestedModportKind::UnsupportedMemberDirection { .. }
+            | InvalidNestedModportKind::NonVariableTerminal { .. }
+            | InvalidNestedModportKind::UnemittableTerminalType { .. }
+            | InvalidNestedModportKind::DefaultCycle { .. } => site.offending,
+        };
+        let first_conflict_location =
+            if matches!(&kind, InvalidNestedModportKind::FlatNameCollision { .. }) {
+                site.first_conflict
+                    .filter(|range| range.source() == site.item_path.source())
+                    .map(SourceSpan::from)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        AnalyzerError::InvalidNestedModport {
+            path: path.into(),
+            kind,
+            input: source(&site.item_path),
+            error_location: primary.into(),
+            first_conflict_location,
+            token_source: site.item_path.source(),
         }
     }
     pub fn invalid_msb(token: &TokenRange) -> Self {
@@ -3372,6 +3486,102 @@ pub enum InvalidModportItemKind {
     Variable,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InvalidNestedModportKind {
+    MissingInterfaceSegment {
+        segment: String,
+    },
+    NonInterfaceSegment {
+        segment: String,
+        actual_kind: String,
+    },
+    ArrayedInterfaceSegment {
+        segment: String,
+    },
+    MissingModport {
+        name: String,
+    },
+    UnsupportedMemberDirection {
+        direction: String,
+    },
+    NonVariableTerminal {
+        name: String,
+        actual_kind: String,
+    },
+    UnemittableTerminalType {
+        name: String,
+        actual_type: String,
+    },
+    EmptyModport {
+        name: String,
+    },
+    FlatNameCollision {
+        flat: String,
+        first_path: String,
+    },
+    DefaultCycle {
+        target: String,
+    },
+    UnloweredLocalReference {
+        path: String,
+    },
+}
+
+impl fmt::Display for InvalidNestedModportKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            InvalidNestedModportKind::MissingInterfaceSegment { segment } => {
+                write!(f, "interface segment \"{segment}\" was not found")
+            }
+            InvalidNestedModportKind::NonInterfaceSegment {
+                segment,
+                actual_kind,
+            } => write!(
+                f,
+                "segment \"{segment}\" is {actual_kind}, not a scalar interface instance"
+            ),
+            InvalidNestedModportKind::ArrayedInterfaceSegment { segment } => {
+                write!(f, "interface segment \"{segment}\" is arrayed")
+            }
+            InvalidNestedModportKind::MissingModport { name } => {
+                write!(f, "child modport \"{name}\" was not found")
+            }
+            InvalidNestedModportKind::UnsupportedMemberDirection { direction } => {
+                write!(f, "member direction \"{direction}\" cannot be flattened")
+            }
+            InvalidNestedModportKind::NonVariableTerminal { name, actual_kind } => write!(
+                f,
+                "terminal \"{name}\" is {actual_kind}, not a plain signal variable"
+            ),
+            InvalidNestedModportKind::UnemittableTerminalType { name, actual_type } => write!(
+                f,
+                "terminal \"{name}\" has unsupported emitted type \"{actual_type}\""
+            ),
+            InvalidNestedModportKind::EmptyModport { name } => {
+                write!(f, "child modport \"{name}\" has no flattenable members")
+            }
+            InvalidNestedModportKind::FlatNameCollision { flat, first_path } => write!(
+                f,
+                "flattened name \"{flat}\" also represents \"{first_path}\""
+            ),
+            InvalidNestedModportKind::DefaultCycle { target } => {
+                write!(f, "default modport cycle reaches \"{target}\"")
+            }
+            InvalidNestedModportKind::UnloweredLocalReference { path } => write!(
+                f,
+                "local reference \"{path}\" is not forwarded by the nested modport"
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NestedModportDiagnosticSite {
+    pub item_path: TokenRange,
+    pub offending: TokenRange,
+    pub first_conflict: Option<TokenRange>,
+}
+
 impl fmt::Display for InvalidModportItemKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3380,12 +3590,21 @@ impl fmt::Display for InvalidModportItemKind {
             }
             InvalidModportItemKind::Function => "function".fmt(f),
             InvalidModportItemKind::Modport => {
-                "unsupported nested modport item because the terminal is not a plain variable".fmt(f)
+                "unsupported nested modport item because the terminal is not a plain variable"
+                    .fmt(f)
             }
             InvalidModportItemKind::Variable => "variable".fmt(f),
         }
     }
 }
+
+#[cfg(test)]
+#[path = "analyzer_error_nested_modport_tests.rs"]
+mod nested_modport_tests;
+
+#[cfg(test)]
+#[path = "analyzer_error_nested_modport_site_tests.rs"]
+mod nested_modport_site_tests;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvalidPortDefaultValueKind {

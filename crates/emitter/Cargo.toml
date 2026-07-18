@@ -22,4 +22,6 @@ veryl-pretty    = {version = "0.20.2", path = "../pretty"}
 veryl-sourcemap = {version = "0.20.2", path = "../sourcemap"}
 
 [dev-dependencies]
+sv-parser = {workspace = true}
 toml = {workspace = true}
+veryl-analyzer = {version = "0.20.2", path = "../analyzer", features = ["nested-modport-test-utils"]}

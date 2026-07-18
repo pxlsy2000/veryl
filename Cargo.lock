@@ -6051,6 +6051,7 @@ name = "veryl-emitter"
 version = "0.20.2"
 dependencies = [
  "serde",
+ "sv-parser",
  "toml",
  "veryl-aligner",
  "veryl-analyzer",

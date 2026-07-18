@@ -1071,6 +1071,8 @@ pub fn eval_type(
     let mut array = Shape::default();
     let mut signed = false;
     let mut is_positive = false;
+    let mut named_path = None;
+    let mut named_generic_context = Vec::new();
 
     let kind = if let Some(x) = path.to_var_path()
         && let Some(x) = context.var_paths.get(&x)
@@ -1078,6 +1080,8 @@ pub fn eval_type(
         match &x.1.value {
             ValueVariant::Type(x) => {
                 let mut x = x.clone();
+                named_path = x.named_path().cloned();
+                named_generic_context = x.named_generic_context().to_vec();
 
                 // append internal width/array
                 width.append(x.width_mut());
@@ -1119,6 +1123,8 @@ pub fn eval_type(
 
             match &symbol.found.kind {
                 SymbolKind::Struct(x) => {
+                    named_path = Some(path.clone());
+                    named_generic_context = context.merged_generic_map().map.into_iter().collect();
                     context.push_generic_map(map.clone());
 
                     let members = context.block(|c| {
@@ -1150,6 +1156,8 @@ pub fn eval_type(
                     })
                 }
                 SymbolKind::Union(x) => {
+                    named_path = Some(path.clone());
+                    named_generic_context = context.merged_generic_map().map.into_iter().collect();
                     context.push_generic_map(map.clone());
 
                     let members = context.block(|c| {
@@ -1180,6 +1188,8 @@ pub fn eval_type(
                     })
                 }
                 SymbolKind::Enum(x) => {
+                    named_path = Some(path.clone());
+                    named_generic_context = context.merged_generic_map().map.into_iter().collect();
                     let r#type = if let Some(enum_type) = &x.r#type {
                         context.push_generic_map(map.clone());
 
@@ -1227,6 +1237,8 @@ pub fn eval_type(
                         context.pop_typedef_visiting();
 
                         let mut r#type = r#type?;
+                        named_path = r#type.named_path().cloned();
+                        named_generic_context = r#type.named_generic_context().to_vec();
 
                         width.append(r#type.width_mut());
                         array.append(&mut r#type.array);
@@ -1250,6 +1262,8 @@ pub fn eval_type(
                 SymbolKind::TypeDef(x) if x.is_proto => {
                     if let Some(x) = &x.r#type {
                         let mut r#type = x.to_ir_type(context, TypePosition::TypeDef)?;
+                        named_path = r#type.named_path().cloned();
+                        named_generic_context = r#type.named_generic_context().to_vec();
                         width.append(r#type.width_mut());
                         array.append(&mut r#type.array);
                         signed = r#type.signed;
@@ -1269,6 +1283,8 @@ pub fn eval_type(
                 SymbolKind::GenericParameter(x) => match &x.bound {
                     GenericBoundKind::Proto(x) => {
                         let mut r#type = x.to_ir_type(context, pos)?;
+                        named_path = r#type.named_path().cloned();
+                        named_generic_context = r#type.named_generic_context().to_vec();
                         width.append(r#type.width_mut());
                         array.append(&mut r#type.array);
                         signed = r#type.signed;
@@ -1296,6 +1312,8 @@ pub fn eval_type(
                     GenericBoundKind::Type => {
                         let (comptime, _) = eval_generic_expr(context, &x.value)?;
                         if let ValueVariant::Type(mut x) = comptime.value {
+                            named_path = x.named_path().cloned();
+                            named_generic_context = x.named_generic_context().to_vec();
                             width.append(x.width_mut());
                             array.append(&mut x.array);
                             x.kind
@@ -1316,6 +1334,8 @@ pub fn eval_type(
 
                             let (comptime, _) = expr?;
                             if let ValueVariant::Type(mut r#type) = comptime.value {
+                                named_path = r#type.named_path().cloned();
+                                named_generic_context = r#type.named_generic_context().to_vec();
                                 width.append(r#type.width_mut());
                                 array.append(&mut r#type.array);
                                 signed = r#type.signed;
@@ -1424,6 +1444,10 @@ pub fn eval_type(
     r#type.signed = signed;
     r#type.is_positive = is_positive;
     r#type.array = array;
+    if let Some(path) = named_path {
+        r#type.set_named_path(path);
+        r#type.set_named_generic_context(named_generic_context);
+    }
     if width_expr.len() == width.as_slice().len() {
         r#type.set_parametric_width(width, width_expr);
     } else {
@@ -2224,7 +2248,7 @@ fn eval_factor_path_inner(
         } else {
             // To resolve external symbol reference,
             // use an independent context to avoid name conflict
-            let mut external_context = Context::default();
+            let mut external_context = context.child();
             external_context.inherit(context);
 
             external_context.push_generic_map(generic_path.to_generic_maps());
@@ -3452,7 +3476,7 @@ fn get_function(context: &mut Context, path: &FuncPath, token: TokenRange) -> Ir
                 vec![]
             };
 
-            let mut local_context = Context::default();
+            let mut local_context = context.child();
             local_context.var_id = context.var_id;
             local_context.inherit(context);
             local_context.extract_var_paths(context, &path.path, &array);
@@ -3465,7 +3489,7 @@ fn get_function(context: &mut Context, path: &FuncPath, token: TokenRange) -> Ir
                     local_context
                         .var_paths
                         .insert(path.clone(), (var_id, comptime));
-                    local_context.variables.insert(var_id, var.clone());
+                    local_context.insert_prepared_variable(var_id, var.clone());
                 }
             }
 
@@ -3473,7 +3497,7 @@ fn get_function(context: &mut Context, path: &FuncPath, token: TokenRange) -> Ir
 
             for path in &generic_arg_paths {
                 if let Some((var_id, _)) = local_context.var_paths.remove(path) {
-                    local_context.variables.remove(&var_id);
+                    local_context.remove_variable(&var_id);
                 }
             }
 
@@ -3556,6 +3580,17 @@ pub fn function_call(
 
     let ret = context.block(|c| {
         let func = get_function(c, &path, token)?;
+        let function_symbol = symbol_table::get(sig.symbol).ok_or_else(|| ir_error!(token))?;
+        let function_ports = match &function_symbol.kind {
+            SymbolKind::Function(function) => &function.ports,
+            _ => return Err(ir_error!(token)),
+        };
+        for (argument, port) in func.args.iter().zip(function_ports) {
+            if let ir::TypeKind::Modport(target, modport) = &argument.comptime.r#type.kind {
+                c.record_nested_expanded_port_candidate(port.token.token.id, target, *modport)
+                    .map_err(|_| ir_error!(token))?;
+            }
+        }
         let (mut inputs, outputs) = args.to_function_args(c, &func, token)?;
 
         let mut comptime = func.r#type.clone();

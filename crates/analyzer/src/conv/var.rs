@@ -2,6 +2,7 @@ use crate::analyzer_error::InvalidSelectKind;
 use crate::conv::checker::separator::check_separator;
 use crate::conv::{Context, Conv};
 use crate::ir::{self, IrResult, VarPath, VarPathSelect, VarSelect, VarSelectOp};
+use crate::nested_modport::OccurrenceKind;
 use crate::symbol_path::{GenericSymbol, GenericSymbolPath};
 use crate::{AnalyzerError, ir_error};
 use veryl_parser::token_range::TokenRange;
@@ -174,6 +175,12 @@ impl Conv<&ExpressionIdentifier> for VarPathSelect {
 
         select.1 = end;
 
+        if context
+            .record_nested_path_candidate(OccurrenceKind::ExpressionIdentifier, token, &path.0)
+            .is_err()
+        {
+            return Err(ir_error!(token));
+        }
         Ok(VarPathSelect(path, select, token))
     }
 }
@@ -247,6 +254,12 @@ impl Conv<&HierarchicalIdentifier> for VarPathSelect {
 
         select.1 = end;
 
+        if context
+            .record_nested_path_candidate(OccurrenceKind::HierarchicalIdentifier, token, &path.0)
+            .is_err()
+        {
+            return Err(ir_error!(token));
+        }
         Ok(VarPathSelect(path, select, token))
     }
 }

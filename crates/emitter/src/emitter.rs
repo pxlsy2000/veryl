@@ -1,9 +1,8 @@
 use crate::expaneded_modport::{
-    ExpandModportConnectionsTable, ExpandedModportPortTable, collect_modport_member_variables,
+    ExpandModportConnectionsTable, ExpandedModportPortTable, ExpandedModportPortType,
 };
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use veryl_aligner::{Aligner, Location, PadKind, align_kind};
 use veryl_analyzer::attribute::Attribute as Attr;
@@ -17,13 +16,18 @@ use veryl_analyzer::ir::{self, IrResult};
 use veryl_analyzer::literal::{Literal, TypeLiteral};
 use veryl_analyzer::msb_table;
 use veryl_analyzer::namespace::{DefineContext, Namespace};
+use veryl_analyzer::nested_modport::{
+    EmissionBindingId, EmissionFrame, EmissionOwnerKind, EmissionPhase, EmissionScopeHandle,
+    LoweringAvailability, NestedModportAnalysis, NestedModportAnalysisInvariant, OccurrenceKind,
+    PreparedEmission, ResolvedDeclarationKind, ResolvedDeclarationType, ResolvedModportEntry,
+    ResolvedModportTerminal, ResolvedNamedType, ResolvedNestedTerminal, ResolvedPathRewrite,
+};
 use veryl_analyzer::resolved_type_table;
 use veryl_analyzer::scope;
 use veryl_analyzer::symbol::Direction as SymDirection;
 use veryl_analyzer::symbol::TypeModifierKind as SymTypeModifierKind;
 use veryl_analyzer::symbol::{
     Affiliation, GenericMap, GenericTables, Port, Symbol, SymbolId, SymbolKind, TestType, TypeKind,
-    VariableProperty,
 };
 use veryl_analyzer::symbol_path::{
     GenericSymbolPath, GenericSymbolPathKind, SymbolPath, SymbolPathNamespace,
@@ -42,6 +46,59 @@ use veryl_pretty::doc::{self, CommentDoc, Doc};
 use veryl_pretty::render::{RenderOpts, render_with_anchors};
 use veryl_sourcemap::SourceMap;
 
+#[cfg(test)]
+thread_local! {
+    static NESTED_DECLARATION_TERMINAL_PROBES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static NESTED_DECLARATION_SCAN_MUTATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) struct NestedDeclarationScanMutationGuard;
+
+#[cfg(test)]
+impl Drop for NestedDeclarationScanMutationGuard {
+    fn drop(&mut self) {
+        NESTED_DECLARATION_SCAN_MUTATION.set(false);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn inject_nested_declaration_scan_mutation() -> NestedDeclarationScanMutationGuard {
+    NESTED_DECLARATION_SCAN_MUTATION.set(true);
+    NestedDeclarationScanMutationGuard
+}
+
+#[cfg(test)]
+fn nested_declaration_scan_mutation_enabled() -> bool {
+    NESTED_DECLARATION_SCAN_MUTATION.get()
+}
+
+#[cfg(not(test))]
+const fn nested_declaration_scan_mutation_enabled() -> bool {
+    false
+}
+
+#[cfg(test)]
+pub(super) fn reset_nested_declaration_terminal_probes() {
+    NESTED_DECLARATION_TERMINAL_PROBES.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn nested_declaration_terminal_probes() -> usize {
+    NESTED_DECLARATION_TERMINAL_PROBES.get()
+}
+
+#[cfg(test)]
+fn record_nested_declaration_terminal_probe() {
+    NESTED_DECLARATION_TERMINAL_PROBES
+        .set(NESTED_DECLARATION_TERMINAL_PROBES.get().saturating_add(1));
+}
+
+#[cfg(not(test))]
+const fn record_nested_declaration_terminal_probe() {}
+
 pub enum AttributeType {
     Ifdef,
     Sv,
@@ -58,22 +115,58 @@ enum Mode {
     Build,
 }
 
-#[derive(Clone)]
-struct NestedInterfaceMember {
-    root: StrId,
-    flat_name: String,
-    token: VerylToken,
-    variable: VariableProperty,
-    direction: SymDirection,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EmitterError {
+    MissingNestedModportLowering {
+        binding: EmissionBindingId,
+    },
+    MissingPathRewrite {
+        binding: EmissionBindingId,
+        token: resource_table::TokenId,
+    },
+    MissingExpandedPortResolution {
+        binding: EmissionBindingId,
+        token: resource_table::TokenId,
+    },
+    ConflictingEmissionBinding {
+        source_path: resource_table::PathId,
+        declaration: resource_table::TokenId,
+        invariant: NestedModportAnalysisInvariant,
+    },
 }
 
-#[derive(Default)]
-struct NestedInterfaceForwarding {
-    members_by_root: BTreeMap<StrId, Vec<NestedInterfaceMember>>,
-    emitted_flat_names: BTreeSet<String>,
+impl std::fmt::Display for EmitterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNestedModportLowering { binding } => {
+                write!(
+                    f,
+                    "missing nested modport lowering for emission binding {binding:?}"
+                )
+            }
+            Self::MissingPathRewrite { binding, token } => write!(
+                f,
+                "missing nested path rewrite for emission binding {binding:?}, token {token:?}"
+            ),
+            Self::MissingExpandedPortResolution { binding, token } => write!(
+                f,
+                "missing expanded port resolution for emission binding {binding:?}, token {token:?}"
+            ),
+            Self::ConflictingEmissionBinding {
+                source_path,
+                declaration,
+                invariant,
+            } => write!(
+                f,
+                "conflicting emission binding at {source_path:?}/{declaration:?}: {invariant}"
+            ),
+        }
+    }
 }
 
-pub struct Emitter {
+impl std::error::Error for EmitterError {}
+
+pub struct Emitter<'a> {
     // ----- Configuration ---------------------------------------------------
     mode: Mode,
     project_name: Option<StrId>,
@@ -95,6 +188,24 @@ pub struct Emitter {
     /// Output source map (Veryl source → emitted SV positions). Built from
     /// `Doc::Anchored` nodes at render time.
     source_map: Option<SourceMap>,
+    src_path: PathBuf,
+    dst_path: PathBuf,
+    map_path: PathBuf,
+    source: resource_table::PathId,
+    prepared_emission: Option<PreparedEmission<'a>>,
+    emission_frame: Option<EmissionFrame<'a>>,
+    package_emission_scope: Option<EmissionScopeHandle>,
+    emission_error: Option<EmitterError>,
+    #[cfg(test)]
+    emission_fault: Option<(EmissionPhase, NestedModportAnalysisInvariant)>,
+    #[cfg(test)]
+    function_frame_fault: Option<(EmissionPhase, NestedModportAnalysisInvariant)>,
+    #[cfg(test)]
+    function_frame_fault_hit: bool,
+    #[cfg(test)]
+    function_expanded_port_fault: bool,
+    #[cfg(test)]
+    package_scope_fault: bool,
 
     // ----- Position / token tracking ---------------------------------------
     indent: usize,
@@ -149,11 +260,9 @@ pub struct Emitter {
     // ----- Modport expansion -----------------------------------------------
     modport_connections_tables: Vec<ExpandModportConnectionsTable>,
     modport_ports_table: Option<ExpandedModportPortTable>,
-    nested_interface_forwarding: Vec<NestedInterfaceForwarding>,
-    nested_modport_items: BTreeMap<SymbolId, Vec<ModportItem>>,
 }
 
-impl Default for Emitter {
+impl Default for Emitter<'_> {
     fn default() -> Self {
         Self {
             mode: Mode::Build,
@@ -166,6 +275,24 @@ impl Default for Emitter {
             doc_buffer: Vec::new(),
             last_emitted_char: None,
             source_map: None,
+            src_path: PathBuf::new(),
+            dst_path: PathBuf::new(),
+            map_path: PathBuf::new(),
+            source: resource_table::PathId(0),
+            prepared_emission: None,
+            emission_frame: None,
+            package_emission_scope: None,
+            emission_error: None,
+            #[cfg(test)]
+            emission_fault: None,
+            #[cfg(test)]
+            function_frame_fault: None,
+            #[cfg(test)]
+            function_frame_fault_hit: false,
+            #[cfg(test)]
+            function_expanded_port_fault: false,
+            #[cfg(test)]
+            package_scope_fault: false,
 
             indent: 0,
             src_line: 1,
@@ -210,8 +337,6 @@ impl Default for Emitter {
 
             modport_connections_tables: Vec::new(),
             modport_ports_table: None,
-            nested_interface_forwarding: Vec::new(),
-            nested_modport_items: BTreeMap::new(),
         }
     }
 }
@@ -269,7 +394,7 @@ fn should_skip_import(arg: &ScopedIdentifier, is_wildcard: bool) -> bool {
     }
 }
 
-impl Emitter {
+impl<'a> Emitter<'a> {
     pub fn new(metadata: &Metadata, src_path: &Path, dst_path: &Path, map_path: &Path) -> Self {
         let source_map = SourceMap::new(src_path, dst_path, map_path);
 
@@ -279,24 +404,106 @@ impl Emitter {
             format_opt: metadata.format.clone(),
             aligner: Aligner::new(),
             source_map: Some(source_map),
+            src_path: src_path.to_path_buf(),
+            dst_path: dst_path.to_path_buf(),
+            map_path: map_path.to_path_buf(),
+            source: resource_table::insert_path(src_path),
             ..Default::default()
         }
     }
 
-    pub fn emit(&mut self, input: &Veryl, raw_input: &str) {
+    pub fn emit(
+        &mut self,
+        input: &Veryl,
+        raw_input: &str,
+        analysis: &'a NestedModportAnalysis,
+    ) -> Result<(), EmitterError> {
+        self.string.clear();
+        self.source_map = Some(SourceMap::new(
+            &self.src_path,
+            &self.dst_path,
+            &self.map_path,
+        ));
+        self.emission_error = None;
+        #[cfg(test)]
+        {
+            self.function_frame_fault_hit = false;
+        }
         self.newline = self.format_opt.newline_style.newline_str(raw_input);
-        self.collect_nested_modport_items(input);
+        self.mode = Mode::Align;
+        self.duplicated_index = 0;
+        self.prepared_emission = Some(
+            analysis
+                .prepare_emission(self.source, EmissionPhase::Align)
+                .map_err(|invariant| self.emitter_error(invariant, resource_table::TokenId(0)))?,
+        );
+        self.veryl(input);
+        #[cfg(test)]
+        if self.function_frame_fault_hit {
+            self.prepared_emission = None;
+            return Err(self
+                .emission_error
+                .take()
+                .expect("function frame fault must record an emitter error"));
+        }
+        #[cfg(test)]
+        if let Some((EmissionPhase::Align, invariant)) = self.emission_fault.as_ref() {
+            let invariant = invariant.clone();
+            self.prepared_emission = None;
+            return Err(self.emitter_error(invariant, resource_table::TokenId(0)));
+        }
+        let prepared = self.prepared_emission.take().ok_or_else(|| {
+            self.emitter_error(
+                NestedModportAnalysisInvariant::UnconsumedBindings,
+                resource_table::TokenId(0),
+            )
+        })?;
+        prepared
+            .finish()
+            .map_err(|invariant| self.emitter_error(invariant, resource_table::TokenId(0)))?;
         if self.format_opt.vertical_align {
-            self.mode = Mode::Align;
-            self.duplicated_index = 0;
-            self.veryl(input);
             self.aligner.finish_group();
             self.aligner.gather_additions();
         }
+
         self.mode = Mode::Build;
         self.doc_buffer = vec![Vec::new()];
         self.duplicated_index = 0;
+        self.prepared_emission = Some(
+            analysis
+                .prepare_emission(self.source, EmissionPhase::Build)
+                .map_err(|invariant| self.emitter_error(invariant, resource_table::TokenId(0)))?,
+        );
         self.veryl(input);
+        #[cfg(test)]
+        if self.function_frame_fault_hit {
+            self.prepared_emission = None;
+            self.doc_buffer.clear();
+            return Err(self
+                .emission_error
+                .take()
+                .expect("function frame fault must record an emitter error"));
+        }
+        #[cfg(test)]
+        if let Some((EmissionPhase::Build, invariant)) = self.emission_fault.as_ref() {
+            let invariant = invariant.clone();
+            self.prepared_emission = None;
+            self.doc_buffer.clear();
+            return Err(self.emitter_error(invariant, resource_table::TokenId(0)));
+        }
+        let prepared = self.prepared_emission.take().ok_or_else(|| {
+            self.emitter_error(
+                NestedModportAnalysisInvariant::UnconsumedBindings,
+                resource_table::TokenId(0),
+            )
+        })?;
+        prepared
+            .finish()
+            .map_err(|invariant| self.emitter_error(invariant, resource_table::TokenId(0)))?;
+        if let Some(error) = self.emission_error.take() {
+            self.doc_buffer.clear();
+            return Err(error);
+        }
         let top = self.doc_buffer.pop().unwrap_or_default();
         let doc = doc::concat(top);
         let opts = RenderOpts {
@@ -314,6 +521,129 @@ impl Emitter {
                 map.add(a.dst_line, a.dst_column, a.src_line, a.src_column, &a.text);
             }
             map.build();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_emission_fault(
+        &mut self,
+        phase: EmissionPhase,
+        invariant: NestedModportAnalysisInvariant,
+    ) {
+        self.emission_fault = Some((phase, invariant));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_function_frame_fault(
+        &mut self,
+        phase: EmissionPhase,
+        invariant: NestedModportAnalysisInvariant,
+    ) {
+        self.function_frame_fault = Some((phase, invariant));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_function_expanded_port_fault(&mut self) {
+        self.function_expanded_port_fault = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_package_scope_fault(&mut self) {
+        self.package_scope_fault = true;
+    }
+
+    fn emitter_error(
+        &self,
+        invariant: NestedModportAnalysisInvariant,
+        declaration: resource_table::TokenId,
+    ) -> EmitterError {
+        let binding = self
+            .emission_frame
+            .map(EmissionFrame::id)
+            .unwrap_or_else(|| EmissionBindingId::new(0));
+        match invariant {
+            NestedModportAnalysisInvariant::MissingLowering => {
+                EmitterError::MissingNestedModportLowering { binding }
+            }
+            NestedModportAnalysisInvariant::MissingRewrite => EmitterError::MissingPathRewrite {
+                binding,
+                token: declaration,
+            },
+            NestedModportAnalysisInvariant::MissingExpandedPort => {
+                EmitterError::MissingExpandedPortResolution {
+                    binding,
+                    token: declaration,
+                }
+            }
+            invariant => EmitterError::ConflictingEmissionBinding {
+                source_path: self.source,
+                declaration,
+                invariant,
+            },
+        }
+    }
+
+    fn record_emission_error(
+        &mut self,
+        invariant: NestedModportAnalysisInvariant,
+        declaration: resource_table::TokenId,
+    ) {
+        if self.emission_error.is_none() {
+            self.emission_error = Some(self.emitter_error(invariant, declaration));
+        }
+    }
+
+    fn take_emission_frames(
+        &mut self,
+        declaration: resource_table::TokenId,
+        kind: EmissionOwnerKind,
+    ) -> Vec<EmissionFrame<'a>> {
+        let result = self
+            .prepared_emission
+            .as_mut()
+            .ok_or(NestedModportAnalysisInvariant::DeclarationOrder)
+            .and_then(|prepared| prepared.take_owners(declaration, kind));
+        match result {
+            Ok(batch) => batch.iter().collect(),
+            Err(invariant) => {
+                self.record_emission_error(invariant, declaration);
+                Vec::new()
+            }
+        }
+    }
+
+    fn take_function_emission_frames(
+        &mut self,
+        declaration: resource_table::TokenId,
+    ) -> Vec<EmissionFrame<'a>> {
+        let enclosing = self.emission_frame;
+        let package = self.package_emission_scope.clone();
+        let result = self
+            .prepared_emission
+            .as_mut()
+            .ok_or(NestedModportAnalysisInvariant::DeclarationOrder)
+            .and_then(|prepared| {
+                prepared.take_function_owners(declaration, enclosing, package.as_ref())
+            });
+        #[cfg(test)]
+        if result.is_ok()
+            && !self.function_frame_fault_hit
+            && let Some((phase, invariant)) = self.function_frame_fault.as_ref()
+            && self
+                .prepared_emission
+                .as_ref()
+                .is_some_and(|prepared| prepared.phase() == *phase)
+        {
+            self.function_frame_fault_hit = true;
+            self.record_emission_error(invariant.clone(), declaration);
+        }
+        match result {
+            Ok(batch) => batch.iter().collect(),
+            Err(invariant) => {
+                self.record_emission_error(invariant, declaration);
+                Vec::new()
+            }
         }
     }
 
@@ -1705,276 +2035,6 @@ impl Emitter {
         self.force_duplicated = false;
     }
 
-    fn collect_nested_interface_forwarding(
-        &self,
-        declarations: &[InterfaceDeclarationList],
-        namespace: &Namespace,
-    ) -> NestedInterfaceForwarding {
-        let mut members_by_root: BTreeMap<StrId, Vec<NestedInterfaceMember>> = BTreeMap::new();
-        let mut seen = BTreeSet::new();
-
-        for declaration in declarations {
-            self.collect_nested_interface_group(
-                &declaration.interface_group,
-                namespace,
-                &mut members_by_root,
-                &mut seen,
-            );
-        }
-
-        NestedInterfaceForwarding {
-            members_by_root,
-            emitted_flat_names: BTreeSet::new(),
-        }
-    }
-
-    fn collect_nested_modport_items(&mut self, input: &Veryl) {
-        self.nested_modport_items.clear();
-        for item in &input.veryl_list {
-            self.collect_nested_modport_description_group(&item.description_group);
-        }
-    }
-
-    fn collect_nested_modport_description_group(&mut self, group: &DescriptionGroup) {
-        match group.description_group_group.as_ref() {
-            DescriptionGroupGroup::LBraceDescriptionGroupGroupListRBrace(x) => {
-                for group in &x.description_group_group_list {
-                    self.collect_nested_modport_description_group(&group.description_group);
-                }
-            }
-            DescriptionGroupGroup::DescriptionItem(x) => {
-                if let DescriptionItem::DescriptionItemOptPublicDescriptionItem(x) =
-                    x.description_item.as_ref()
-                    && let PublicDescriptionItem::InterfaceDeclaration(x) =
-                        x.public_description_item.as_ref()
-                {
-                    self.collect_nested_modport_interface(&x.interface_declaration);
-                }
-            }
-        }
-    }
-
-    fn collect_nested_modport_interface(&mut self, interface: &InterfaceDeclaration) {
-        for declaration in &interface.interface_declaration_list {
-            self.collect_nested_modport_interface_group(&declaration.interface_group);
-        }
-    }
-
-    fn collect_nested_modport_interface_group(&mut self, group: &InterfaceGroup) {
-        match group.interface_group_group.as_ref() {
-            InterfaceGroupGroup::LBraceInterfaceGroupGroupListRBrace(x) => {
-                for group in &x.interface_group_group_list {
-                    self.collect_nested_modport_interface_group(&group.interface_group);
-                }
-            }
-            InterfaceGroupGroup::InterfaceItem(x) => {
-                if let InterfaceItem::ModportDeclaration(x) = x.interface_item.as_ref() {
-                    self.collect_nested_modport_declaration(&x.modport_declaration);
-                }
-            }
-        }
-    }
-
-    fn collect_nested_modport_declaration(&mut self, declaration: &ModportDeclaration) {
-        let Ok(symbol) = symbol_table::resolve(declaration.identifier.as_ref()) else {
-            return;
-        };
-        let Some(items) = &declaration.modport_declaration_opt else {
-            return;
-        };
-
-        let items: Vec<&ModportItem> = items.modport_list.as_ref().into();
-        self.nested_modport_items
-            .insert(symbol.found.id, items.into_iter().cloned().collect());
-    }
-
-    fn collect_nested_interface_group(
-        &self,
-        group: &InterfaceGroup,
-        namespace: &Namespace,
-        members_by_root: &mut BTreeMap<StrId, Vec<NestedInterfaceMember>>,
-        seen: &mut BTreeSet<(StrId, String)>,
-    ) {
-        match group.interface_group_group.as_ref() {
-            InterfaceGroupGroup::LBraceInterfaceGroupGroupListRBrace(x) => {
-                for group in &x.interface_group_group_list {
-                    self.collect_nested_interface_group(
-                        &group.interface_group,
-                        namespace,
-                        members_by_root,
-                        seen,
-                    );
-                }
-            }
-            InterfaceGroupGroup::InterfaceItem(x) => {
-                if let InterfaceItem::ModportDeclaration(x) = x.interface_item.as_ref()
-                    && let Some(items) = &x.modport_declaration.modport_declaration_opt
-                {
-                    let items: Vec<&ModportItem> = items.modport_list.as_ref().into();
-                    for item in items {
-                        for member in self
-                            .collect_nested_modport_item(item.modport_item_path.as_ref(), namespace)
-                        {
-                            if seen.insert((member.root, member.flat_name.clone())) {
-                                members_by_root.entry(member.root).or_default().push(member);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_nested_modport_item(
-        &self,
-        path: &ModportItemPath,
-        namespace: &Namespace,
-    ) -> Vec<NestedInterfaceMember> {
-        let mut visiting = BTreeSet::new();
-        self.collect_nested_modport_item_with_prefix(
-            path,
-            namespace,
-            &[],
-            &path.identifier.identifier_token,
-            &mut visiting,
-        )
-    }
-
-    fn collect_nested_modport_item_with_prefix(
-        &self,
-        path: &ModportItemPath,
-        namespace: &Namespace,
-        prefix: &[StrId],
-        token: &VerylToken,
-        visiting: &mut BTreeSet<SymbolId>,
-    ) -> Vec<NestedInterfaceMember> {
-        if path.modport_item_path_list.is_empty() {
-            return Vec::new();
-        }
-
-        let mut ids = vec![path.identifier.text()];
-        ids.extend(
-            path.modport_item_path_list
-                .iter()
-                .map(|x| x.identifier.text()),
-        );
-        let Some((_, instance_path)) = ids.split_last() else {
-            return Vec::new();
-        };
-        if instance_path.is_empty() {
-            return Vec::new();
-        }
-
-        let resolved_namespace = symbol_table::resolve(path.identifier.as_ref())
-            .ok()
-            .map(|x| x.found.namespace.clone());
-        let symbol_path = SymbolPath::new(&ids);
-        let Ok(symbol) = symbol_table::resolve((
-            &symbol_path,
-            resolved_namespace.as_ref().unwrap_or(namespace),
-        )) else {
-            return Vec::new();
-        };
-        if !matches!(symbol.found.kind, SymbolKind::Modport(_)) {
-            return Vec::new();
-        }
-
-        let mut full_instance_path = prefix.to_vec();
-        full_instance_path.extend(instance_path);
-        self.collect_nested_modport_symbol_members(
-            &symbol.found,
-            &full_instance_path,
-            token,
-            visiting,
-        )
-    }
-
-    fn collect_nested_modport_symbol_members(
-        &self,
-        symbol: &Symbol,
-        instance_path: &[StrId],
-        token: &VerylToken,
-        visiting: &mut BTreeSet<SymbolId>,
-    ) -> Vec<NestedInterfaceMember> {
-        if !visiting.insert(symbol.id) {
-            return Vec::new();
-        }
-
-        let mut members: Vec<NestedInterfaceMember> =
-            if let Some((&root, _)) = instance_path.split_first() {
-                collect_modport_member_variables(symbol)
-                    .into_iter()
-                    .map(|(variable_token, variable, direction)| {
-                        let mut flat_path: Vec<String> =
-                            instance_path.iter().map(ToString::to_string).collect();
-                        flat_path.push(variable_token.to_string());
-                        let flat_name = flat_path.join("__");
-                        NestedInterfaceMember {
-                            root,
-                            flat_name: flat_name.clone(),
-                            token: token.replace(&flat_name),
-                            variable,
-                            direction,
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-        if let Some(items) = self.nested_modport_items.get(&symbol.id) {
-            for item in items {
-                if matches!(item.direction.as_ref(), Direction::Modport(_)) {
-                    members.extend(self.collect_nested_modport_item_with_prefix(
-                        item.modport_item_path.as_ref(),
-                        &symbol.namespace,
-                        instance_path,
-                        token,
-                        visiting,
-                    ));
-                }
-            }
-        }
-
-        visiting.remove(&symbol.id);
-        members
-    }
-
-    fn emit_nested_interface_declarations(&mut self, root: StrId) -> bool {
-        let members = self.nested_interface_forwarding.last_mut().and_then(|x| {
-            let members = x.members_by_root.get(&root)?;
-            let pending: Vec<_> = members
-                .iter()
-                .filter(|member| x.emitted_flat_names.insert(member.flat_name.clone()))
-                .cloned()
-                .collect();
-            Some(pending)
-        });
-        let Some(members) = members else {
-            return false;
-        };
-
-        for (i, member) in members.iter().enumerate() {
-            if i != 0 {
-                self.newline();
-            }
-            let Some(array_type) = member.variable.r#type.array_type.as_ref() else {
-                continue;
-            };
-            self.scalar_type(&array_type.scalar_type);
-            self.space(1);
-            self.align_start(align_kind::IDENTIFIER);
-            self.duplicated_token(&member.token);
-            self.align_finish(align_kind::IDENTIFIER);
-            if let Some(ref x) = array_type.array_type_opt {
-                self.space(1);
-                self.array(&x.array);
-            }
-            self.str(";");
-        }
-        true
-    }
-
     fn emit_modport_item_path(&mut self, path: &ModportItemPath) {
         self.identifier(&path.identifier);
         for x in &path.modport_item_path_list {
@@ -1983,129 +2043,206 @@ impl Emitter {
         }
     }
 
-    fn emit_nested_modport_item(&mut self, arg: &ModportItem) -> bool {
-        if !matches!(arg.direction.as_ref(), Direction::Modport(_)) {
-            return false;
+    fn current_path_rewrite(
+        &mut self,
+        kind: OccurrenceKind,
+        token: resource_table::TokenId,
+    ) -> Option<(&'a ResolvedPathRewrite, &'a ResolvedNestedTerminal)> {
+        let frame = self.emission_frame?;
+        let rewrite = frame.published_rewrite(kind, token)?;
+        match frame.resolve_terminal(&rewrite.terminal) {
+            Ok(terminal) => Some((rewrite, terminal)),
+            Err(invariant) => {
+                self.record_emission_error(invariant, token);
+                None
+            }
         }
-        let Some(namespace) = self
-            .nested_interface_forwarding
-            .last()
-            .and_then(|_| symbol_table::resolve(arg.modport_item_path.identifier.as_ref()).ok())
-            .map(|x| x.found.namespace.clone())
-        else {
+    }
+
+    fn current_nested_lowering(
+        &self,
+    ) -> Option<&'a veryl_analyzer::nested_modport::NestedModportLowering> {
+        match self.emission_frame?.lowering() {
+            LoweringAvailability::Found(lowering) => Some(lowering),
+            LoweringAvailability::NotNested => None,
+        }
+    }
+
+    fn emit_resolved_nested_declarations(&mut self, root: &Identifier) -> bool {
+        let Some(lowering) = self.current_nested_lowering() else {
             return false;
         };
-        let members = self.collect_nested_modport_item(arg.modport_item_path.as_ref(), &namespace);
-        if members.is_empty() {
+        let terminals: Vec<_> = if nested_declaration_scan_mutation_enabled() {
+            lowering
+                .terminals
+                .iter()
+                .filter(|terminal| {
+                    record_nested_declaration_terminal_probe();
+                    terminal.identifier.source_segments.first()
+                        == Some(&root.identifier_token.token.text)
+                })
+                .collect()
+        } else {
+            lowering
+                .terminals_for_root(root.identifier_token.token.text)
+                .inspect(|_| record_nested_declaration_terminal_probe())
+                .collect()
+        };
+        if terminals.is_empty() {
             return false;
         }
-
-        for (i, member) in members.iter().enumerate() {
+        for (i, terminal) in terminals.into_iter().enumerate() {
             if i != 0 {
-                self.str(",");
                 self.newline();
             }
-            let direction = arg.colon.colon_token.replace(&member.direction.to_string());
-            self.align_start(align_kind::DIRECTION);
-            self.duplicated_token(&direction);
-            self.align_finish(align_kind::DIRECTION);
-            self.space(1);
-            self.align_start(align_kind::IDENTIFIER);
-            self.duplicated_token(&member.token);
-            self.align_finish(align_kind::IDENTIFIER);
+            self.emit_resolved_terminal_declaration(terminal, &root.identifier_token);
         }
         true
     }
 
-    fn nested_modport_reference(
-        &self,
-        arg: &ExpressionIdentifier,
-    ) -> Option<(VerylToken, String, usize)> {
-        if !arg.expression_identifier_list.is_empty() || arg.expression_identifier_list0.len() < 2 {
-            return None;
+    fn emit_resolved_terminal_declaration(
+        &mut self,
+        terminal: &ResolvedNestedTerminal,
+        origin: &VerylToken,
+    ) {
+        self.emit_resolved_declaration_type(&terminal.resolved_type.declaration, origin);
+        self.space(1);
+        self.align_start(align_kind::IDENTIFIER);
+        let identifier = origin.replace(&terminal.emitted_identifier.logical().to_string());
+        self.duplicated_token(&identifier);
+        self.align_finish(align_kind::IDENTIFIER);
+        for dimension in &terminal.resolved_type.declaration.unpacked_expr {
+            self.space(1);
+            self.duplicated_token(&origin.replace(&format!("[{}]", dimension.to_sv_expr())));
         }
-        let terminal_member = arg.expression_identifier_list0.len().saturating_sub(1);
-        if arg
-            .expression_identifier_list0
-            .iter()
-            .take(terminal_member)
-            .any(|x| !x.expression_identifier_list0_list.is_empty())
-        {
-            return None;
-        }
-
-        let base = symbol_table::resolve(arg.scoped_identifier.as_ref()).ok()?;
-        let SymbolKind::Port(port) = &base.found.kind else {
-            return None;
-        };
-        let Some((_, Some(modport))) = port.r#type.trace_user_defined(Some(&base.found.namespace))
-        else {
-            return None;
-        };
-        if !matches!(modport.kind, SymbolKind::Modport(_)) {
-            return None;
-        }
-        let port_identifier = arg.scoped_identifier.identifier();
-        let path_segments = arg
-            .expression_identifier_list0
-            .iter()
-            .map(|x| x.identifier.text().to_string())
-            .collect::<Vec<_>>();
-        let mut visiting = BTreeSet::new();
-        let members = self
-            .collect_nested_modport_symbol_members(&modport, &[], &port_identifier, &mut visiting);
-        for prefix_len in (1..=path_segments.len()).rev() {
-            let flat_path = path_segments[..prefix_len].join("__");
-            if members.iter().any(|member| member.flat_name == flat_path) {
-                let text = format!("{port_identifier}.{flat_path}");
-                return Some((port_identifier.clone(), text, prefix_len));
-            }
-        }
-        None
+        self.str(";");
     }
 
-    fn nested_interface_local_reference(
-        &self,
-        arg: &ExpressionIdentifier,
-    ) -> Option<(VerylToken, String, usize)> {
-        if !arg.expression_identifier_list.is_empty() || arg.expression_identifier_list0.is_empty()
-        {
-            return None;
+    fn emit_resolved_declaration_type(
+        &mut self,
+        declaration: &ResolvedDeclarationType,
+        origin: &VerylToken,
+    ) {
+        self.align_start(align_kind::TYPE);
+        match &declaration.kind {
+            ResolvedDeclarationKind::Clock
+            | ResolvedDeclarationKind::ClockPosedge
+            | ResolvedDeclarationKind::ClockNegedge
+            | ResolvedDeclarationKind::Reset
+            | ResolvedDeclarationKind::ResetAsyncHigh
+            | ResolvedDeclarationKind::ResetAsyncLow
+            | ResolvedDeclarationKind::ResetSyncHigh
+            | ResolvedDeclarationKind::ResetSyncLow
+            | ResolvedDeclarationKind::Logic => {
+                self.duplicated_token(&origin.replace("logic"));
+            }
+            ResolvedDeclarationKind::Bit => self.duplicated_token(&origin.replace("bit")),
+            ResolvedDeclarationKind::F32 => self.duplicated_token(&origin.replace("shortreal")),
+            ResolvedDeclarationKind::F64 => self.duplicated_token(&origin.replace("real")),
+            ResolvedDeclarationKind::String => self.duplicated_token(&origin.replace("string")),
+            ResolvedDeclarationKind::Struct(named)
+            | ResolvedDeclarationKind::Union(named)
+            | ResolvedDeclarationKind::Enum(named) => {
+                self.emit_resolved_named_type(named, origin);
+            }
         }
-        let terminal_member = arg.expression_identifier_list0.len().saturating_sub(1);
-        if arg
-            .expression_identifier_list0
-            .iter()
-            .take(terminal_member)
-            .any(|x| !x.expression_identifier_list0_list.is_empty())
-        {
-            return None;
+        if declaration.signed {
+            self.space(1);
+            self.duplicated_token(&origin.replace("signed"));
         }
+        self.align_finish(align_kind::TYPE);
+        self.align_start(align_kind::WIDTH);
+        for dimension in &declaration.packed_expr {
+            let dimension = dimension.to_sv_width_string();
+            if !dimension.is_empty() {
+                self.duplicated_token(&origin.replace(&dimension));
+            }
+        }
+        self.align_finish(align_kind::WIDTH);
+    }
 
-        let root = arg.scoped_identifier.identifier();
-        let mut path_segments = vec![root.to_string()];
-        path_segments.extend(
-            arg.expression_identifier_list0
-                .iter()
-                .map(|x| x.identifier.text().to_string()),
+    fn emit_resolved_named_type(
+        &mut self,
+        named: &ResolvedNamedType,
+        emission_origin: &VerylToken,
+    ) {
+        let Some(symbol) = symbol_table::get(named.symbol) else {
+            self.record_emission_error(
+                NestedModportAnalysisInvariant::MissingLowering,
+                named.token.beg.id,
+            );
+            return;
+        };
+        let origin = VerylToken::new(named.token.beg);
+        let context: SymbolContext = self.into();
+        let text = symbol_string(
+            emission_origin,
+            &symbol,
+            &symbol.namespace,
+            &named.full_path,
+            &named.generic_tables,
+            &context,
+            1,
         );
-        let members = self
-            .nested_interface_forwarding
-            .last()
-            .and_then(|x| x.members_by_root.get(&root.token.text))?;
-        for prefix_len in (1..=path_segments.len()).rev() {
-            let text = path_segments[..prefix_len].join("__");
-            if members.iter().any(|x| x.flat_name == text) {
-                return Some((root.clone(), text, prefix_len - 1));
-            }
-        }
-        None
+        self.duplicated_token(&origin.replace(&text));
     }
 
-    fn is_forwarded_nested_interface_root(&self, id: StrId) -> bool {
-        self.nested_interface_forwarding
-            .last()
-            .is_some_and(|x| x.members_by_root.contains_key(&id))
+    fn emit_resolved_modport_declaration(&mut self, arg: &ModportDeclaration) -> bool {
+        let Some(modport) = self
+            .current_nested_lowering()
+            .and_then(|lowering| lowering.modports.get(&arg.identifier.text()))
+        else {
+            return false;
+        };
+        let entries: Vec<_> = modport.entries.iter().collect();
+        self.modport(&arg.modport);
+        self.space(1);
+        self.identifier(&arg.identifier);
+        self.space(1);
+        self.token_will_push(&arg.l_brace.l_brace_token.replace("("));
+        self.newline_push();
+        for (i, entry) in entries.into_iter().enumerate() {
+            if i != 0 {
+                self.str(",");
+                self.newline();
+            }
+            self.emit_resolved_modport_entry(entry, &arg.identifier.identifier_token);
+        }
+        self.newline_pop();
+        self.clear_adjust_line();
+        self.token(&arg.r_brace.r_brace_token.replace(")"));
+        self.str(";");
+        true
+    }
+
+    fn emit_resolved_modport_entry(&mut self, entry: &ResolvedModportEntry, origin: &VerylToken) {
+        self.align_start(align_kind::DIRECTION);
+        self.duplicated_token(&origin.replace(&entry.direction.to_string()));
+        self.align_finish(align_kind::DIRECTION);
+        self.space(1);
+        self.align_start(align_kind::IDENTIFIER);
+        let identifier = match &entry.terminal {
+            Some(ResolvedModportTerminal::FlattenedVariable { terminal }) => self
+                .current_nested_lowering()
+                .and_then(|lowering| lowering.terminals.get(terminal.0 as usize))
+                .map(|terminal| terminal.emitted_identifier.logical()),
+            Some(ResolvedModportTerminal::DirectVariable {
+                emitted_identifier, ..
+            }) => Some(emitted_identifier.logical()),
+            Some(ResolvedModportTerminal::DirectFunction { .. }) | None => {
+                entry.path.as_slice().first().copied()
+            }
+        };
+        if let Some(identifier) = identifier {
+            let token = origin.replace(&identifier.to_string());
+            self.duplicated_token(&token);
+        } else {
+            self.record_emission_error(
+                NestedModportAnalysisInvariant::MissingLowering,
+                origin.token.id,
+            );
+        }
+        self.align_finish(align_kind::IDENTIFIER);
     }
 
     fn emit_inst(
@@ -2147,12 +2284,19 @@ impl Emitter {
             vec![]
         };
 
-        let modport_connections_table = ExpandModportConnectionsTable::create_from_inst_ports(
+        let modport_connections_table = match ExpandModportConnectionsTable::create_from_inst_ports(
             &defined_ports,
             &connected_ports,
             &generic_map,
             &symbol.namespace,
-        );
+            self.emission_frame,
+        ) {
+            Ok(table) => table,
+            Err(invariant) => {
+                self.record_emission_error(invariant, header_token.token.id);
+                ExpandModportConnectionsTable::new()
+            }
+        };
         self.modport_connections_tables
             .push(modport_connections_table);
         self.inst_module_namespace = Some(symbol.inner_namespace());
@@ -2172,6 +2316,13 @@ impl Emitter {
             self.align_start(align_kind::TYPE);
         }
         self.scoped_identifier(&arg.scoped_identifier);
+        let instantiation_token = arg.scoped_identifier.identifier().token.id;
+        let instantiation_context = self
+            .emission_frame
+            .and_then(|frame| frame.published_instantiation_context(instantiation_token));
+        if let Some(context) = instantiation_context {
+            self.emit_connected_declaration_suffix(context);
+        }
         self.space(1);
         if single_line {
             self.align_finish(align_kind::TYPE);
@@ -2673,7 +2824,7 @@ impl Emitter {
 
         self.newline();
         self.clear_adjust_line();
-        self.function_declaration(definition);
+        self.referenced_global_function_declaration(definition);
     }
 
     fn emit_function_call(
@@ -2737,12 +2888,22 @@ impl Emitter {
         }
         let n_args = if let Some(ref x) = function_call.function_call_opt {
             let modport_connections_table =
-                ExpandModportConnectionsTable::create_from_argument_list(
+                match ExpandModportConnectionsTable::create_from_argument_list(
                     &defined_ports,
                     &x.argument_list,
                     &generic_map,
                     &namespace,
-                );
+                    self.emission_frame,
+                ) {
+                    Ok(table) => table,
+                    Err(invariant) => {
+                        self.record_emission_error(
+                            invariant,
+                            function_call.l_paren.l_paren_token.token.id,
+                        );
+                        ExpandModportConnectionsTable::new()
+                    }
+                };
             self.modport_connections_tables
                 .push(modport_connections_table);
             self.argument_list(&x.argument_list);
@@ -3042,9 +3203,130 @@ impl Emitter {
 
         self.token(&token.replace(&name));
     }
+
+    fn referenced_global_function_declaration(&mut self, arg: &FunctionDeclaration) {
+        let symbol = symbol_table::resolve(arg.identifier.as_ref()).unwrap();
+        let contexts = self
+            .get_generic_maps(&symbol.found)
+            .into_iter()
+            .map(|map| (map, self.emission_frame))
+            .collect();
+        self.emit_function_declaration(arg, &symbol.found, contexts);
+    }
+
+    fn emit_function_declaration(
+        &mut self,
+        arg: &FunctionDeclaration,
+        symbol: &Symbol,
+        contexts: Vec<(GenericMap, Option<EmissionFrame<'a>>)>,
+    ) {
+        let enclosing_frame = self.emission_frame;
+        let enclosing_modport_ports_table = self.modport_ports_table.take();
+
+        for (i, (map, frame)) in contexts.into_iter().enumerate() {
+            if i != 0 {
+                self.newline();
+            }
+            self.emission_frame = frame;
+            self.push_generic_map(map.clone());
+
+            if let SymbolKind::Function(ref x) = symbol.kind {
+                #[cfg(test)]
+                let fault_token = self.function_expanded_port_fault.then(|| {
+                    x.ports
+                        .iter()
+                        .find(|port| matches!(port.property().direction, SymDirection::Modport))
+                        .map(|port| port.token.token.id)
+                });
+                #[cfg(not(test))]
+                let fault_token: Option<Option<resource_table::TokenId>> = None;
+                let modport_ports_table = if let Some(Some(token)) = fault_token {
+                    self.record_emission_error(
+                        NestedModportAnalysisInvariant::MissingExpandedPort,
+                        token,
+                    );
+                    None
+                } else {
+                    match ExpandedModportPortTable::create(
+                        &x.ports,
+                        &self.get_generic_map(),
+                        &arg.identifier.identifier_token,
+                        &symbol.namespace,
+                        true,
+                        &self.into(),
+                        frame,
+                    ) {
+                        Ok(table) => Some(table),
+                        Err(invariant) => {
+                            self.record_emission_error(
+                                invariant,
+                                arg.identifier.identifier_token.token.id,
+                            );
+                            None
+                        }
+                    }
+                };
+                if let Some(modport_ports_table) = modport_ports_table
+                    && !modport_ports_table.is_empty()
+                {
+                    self.modport_ports_table = Some(modport_ports_table);
+                }
+            }
+
+            self.emit_generic_instance_name_comment(&map);
+            self.function(&arg.function);
+            self.space(1);
+            self.str("automatic");
+            self.space(1);
+            if let Some(ref x) = arg.function_declaration_opt1 {
+                self.emit_scalar_type(&x.scalar_type, false);
+            } else {
+                self.str("void");
+            }
+            self.space(1);
+            if map.generic() {
+                self.emit_generic_instance_name(&arg.identifier.identifier_token, &map, true);
+            } else {
+                self.identifier(&arg.identifier);
+            }
+            if let Some(ref x) = arg.function_declaration_opt0 {
+                self.port_declaration(&x.port_declaration);
+                self.space(1);
+            }
+            if let Some(ref x) = arg.function_declaration_opt1 {
+                self.token(&x.minus_g_t.minus_g_t_token.replace(""));
+            }
+            self.str(";");
+            self.emit_statement_block(&arg.statement_block, "", "endfunction");
+
+            self.pop_generic_map();
+            self.align_reset();
+        }
+
+        self.modport_ports_table = enclosing_modport_ports_table;
+        self.emission_frame = enclosing_frame;
+    }
+
+    fn emit_connected_declaration_suffix(
+        &mut self,
+        context: &veryl_analyzer::nested_modport::EmissionSpecializationContext,
+    ) {
+        if !context.emit_connected_variant {
+            return;
+        }
+        for (formal_port, generic_map) in &context.connected_generic_maps {
+            let Some(_) = generic_map.id else {
+                continue;
+            };
+            self.str("__");
+            self.str(&formal_port.to_string());
+            self.str("__");
+            self.str(&generic_map.name(false, self.build_opt.hashed_mangled_name));
+        }
+    }
 }
 
-impl VerylWalker for Emitter {
+impl VerylWalker for Emitter<'_> {
     /// Semantic action for non-terminal 'VerylToken'
     fn veryl_token(&mut self, arg: &VerylToken) {
         self.token(arg);
@@ -3340,6 +3622,43 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'HierarchicalIdentifier'
     fn hierarchical_identifier(&mut self, arg: &HierarchicalIdentifier) {
+        if let Some((rewrite, terminal)) =
+            self.current_path_rewrite(OccurrenceKind::HierarchicalIdentifier, arg.first().id)
+        {
+            let leading_segments = rewrite
+                .consumed_segments
+                .saturating_sub(rewrite.semantic_segments.len());
+            if leading_segments == 0 {
+                let token = arg
+                    .identifier
+                    .identifier_token
+                    .replace(&terminal.emitted_identifier.logical().to_string());
+                self.veryl_token(&token);
+            } else {
+                self.identifier(&arg.identifier);
+            }
+            for x in &arg.hierarchical_identifier_list {
+                self.select(&x.select);
+            }
+            for (i, x) in arg.hierarchical_identifier_list0.iter().enumerate() {
+                let segment = i + 1;
+                if segment == leading_segments {
+                    let token = x
+                        .identifier
+                        .identifier_token
+                        .replace(&terminal.emitted_identifier.logical().to_string());
+                    self.dot(&x.dot);
+                    self.veryl_token(&token);
+                } else if segment >= rewrite.consumed_segments {
+                    self.dot(&x.dot);
+                    self.identifier(&x.identifier);
+                }
+                for select in &x.hierarchical_identifier_list0_list {
+                    self.select(&select.select);
+                }
+            }
+            return;
+        }
         let list_len = &arg.hierarchical_identifier_list0.len();
         let array_size = if self.build_opt.flatten_array_interface
             && !arg.hierarchical_identifier_list.is_empty()
@@ -3455,21 +3774,19 @@ impl VerylWalker for Emitter {
     /// Semantic action for non-terminal 'ExpressionIdentifier'
     fn expression_identifier(&mut self, arg: &ExpressionIdentifier) {
         let mut expanded_modport = None;
-        if let Some(table) = self.modport_ports_table.as_ref()
-            && let Some(member_identifier) = arg.expression_identifier_list0.first()
-        {
+        if let Some(table) = self.modport_ports_table.as_ref() {
             let port_identifier = arg.scoped_identifier.identifier();
+            let member_path: Vec<_> = arg
+                .expression_identifier_list0
+                .iter()
+                .map(|segment| segment.identifier.identifier_token.token.text)
+                .collect();
             expanded_modport = table
-                .get_modport_member(
-                    &port_identifier.token,
-                    &member_identifier.identifier.identifier_token.token,
-                    &[],
-                )
+                .get_modport_member_path(&port_identifier.token, &member_path, &[])
                 .map(|x| (port_identifier, x));
         }
         let nested_reference = if expanded_modport.is_none() {
-            self.nested_interface_local_reference(arg)
-                .or_else(|| self.nested_modport_reference(arg))
+            self.current_path_rewrite(OccurrenceKind::ExpressionIdentifier, arg.first().id)
         } else {
             None
         };
@@ -3489,9 +3806,26 @@ impl VerylWalker for Emitter {
             let text = modport_member.identifier.to_string();
             self.veryl_token(&token.replace(&text));
             self.push_resolved_identifier(&text);
-        } else if let Some((token, text, _)) = nested_reference.as_ref() {
-            self.veryl_token(&token.replace(text));
-            self.push_resolved_identifier(text);
+        } else if let Some((rewrite, terminal)) = nested_reference {
+            let leading_segments = rewrite
+                .consumed_segments
+                .saturating_sub(rewrite.semantic_segments.len());
+            if leading_segments == 0 {
+                let token = arg
+                    .scoped_identifier
+                    .identifier()
+                    .replace(&terminal.emitted_identifier.logical().to_string());
+                self.veryl_token(&token);
+                self.push_resolved_identifier(&token.to_string());
+            } else {
+                self.scoped_identifier(&arg.scoped_identifier);
+                for x in &arg.expression_identifier_list {
+                    self.select(&x.select);
+                }
+                for _ in &arg.expression_identifier_list {
+                    self.push_resolved_identifier("[0]");
+                }
+            }
         } else if array_size.len() > 1 {
             let select: Vec<_> = arg
                 .expression_identifier_list
@@ -3511,9 +3845,30 @@ impl VerylWalker for Emitter {
             }
         }
 
-        let nested_skip = nested_reference.as_ref().map_or(0, |(_, _, len)| *len);
+        let nested_consumed = nested_reference.map_or(0, |(rewrite, _)| rewrite.consumed_segments);
+        let nested_leading = nested_reference.map_or(0, |(rewrite, _)| {
+            rewrite
+                .consumed_segments
+                .saturating_sub(rewrite.semantic_segments.len())
+        });
         for (i, x) in arg.expression_identifier_list0.iter().enumerate() {
-            if i >= nested_skip && (i > 0 || expanded_modport.is_none()) {
+            let segment = i + 1;
+            if let Some((_, terminal)) = nested_reference
+                && segment == nested_leading
+            {
+                let token = x
+                    .identifier
+                    .identifier_token
+                    .replace(&terminal.emitted_identifier.logical().to_string());
+                self.dot(&x.dot);
+                self.push_resolved_identifier(".");
+                self.veryl_token(&token);
+                self.push_resolved_identifier(&token.to_string());
+            } else if segment >= nested_consumed
+                && expanded_modport
+                    .as_ref()
+                    .is_none_or(|(_, member)| segment > member.source_segments.len())
+            {
                 self.dot(&x.dot);
                 self.push_resolved_identifier(".");
                 if (i + 1) < arg.expression_identifier_list0.len() {
@@ -5284,6 +5639,9 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'ModportDeclaration'
     fn modport_declaration(&mut self, arg: &ModportDeclaration) {
+        if self.emit_resolved_modport_declaration(arg) {
+            return;
+        }
         self.modport(&arg.modport);
         self.space(1);
         self.identifier(&arg.identifier);
@@ -5333,10 +5691,6 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'ModportItem'
     fn modport_item(&mut self, arg: &ModportItem) {
-        if self.emit_nested_modport_item(arg) {
-            return;
-        }
-
         self.direction(&arg.direction);
         self.space(1);
         self.align_start(align_kind::IDENTIFIER);
@@ -5348,14 +5702,9 @@ impl VerylWalker for Emitter {
     fn generate_item(&mut self, arg: &GenerateItem) {
         match arg {
             GenerateItem::InstDeclaration(x)
-                if self.is_forwarded_nested_interface_root(
-                    x.inst_declaration.component_instantiation.identifier.text(),
-                ) =>
-            {
-                self.emit_nested_interface_declarations(
-                    x.inst_declaration.component_instantiation.identifier.text(),
-                );
-            }
+                if self.emit_resolved_nested_declarations(
+                    &x.inst_declaration.component_instantiation.identifier,
+                ) => {}
             GenerateItem::LetDeclaration(x) => self.let_declaration(&x.let_declaration),
             GenerateItem::VarDeclaration(x) => self.var_declaration(&x.var_declaration),
             GenerateItem::InstDeclaration(x) => self.inst_declaration(&x.inst_declaration),
@@ -5958,26 +6307,49 @@ impl VerylWalker for Emitter {
                             self.str(",");
                             self.newline();
                         }
-                        let array_type = port.r#type.array_type.as_ref().unwrap();
-
                         self.align_start(align_kind::DIRECTION);
                         self.duplicated_token(&port.direction_token);
                         self.align_finish(align_kind::DIRECTION);
                         self.space(1);
 
-                        self.scalar_type(&array_type.scalar_type);
+                        match &port.r#type {
+                            ExpandedModportPortType::Direct(r#type) => {
+                                if let Some(array_type) = r#type.array_type.as_ref() {
+                                    self.scalar_type(&array_type.scalar_type);
+                                }
+                            }
+                            ExpandedModportPortType::Resolved(declaration) => {
+                                self.emit_resolved_declaration_type(declaration, &port.identifier);
+                            }
+                        }
                         self.space(1);
 
                         self.align_start(align_kind::IDENTIFIER);
                         self.duplicated_token(&port.identifier);
                         self.align_finish(align_kind::IDENTIFIER);
 
-                        if let Some(ref x) = array_type.array_type_opt {
-                            self.space(1);
-                            self.array(&x.array);
-                        } else {
-                            let loc = self.align_last_location(align_kind::IDENTIFIER);
-                            self.align_dummy_location(align_kind::ARRAY, loc);
+                        match &port.r#type {
+                            ExpandedModportPortType::Direct(r#type) => {
+                                if let Some(array_type) = r#type.array_type.as_ref()
+                                    && let Some(ref x) = array_type.array_type_opt
+                                {
+                                    self.space(1);
+                                    self.array(&x.array);
+                                } else {
+                                    let loc = self.align_last_location(align_kind::IDENTIFIER);
+                                    self.align_dummy_location(align_kind::ARRAY, loc);
+                                }
+                            }
+                            ExpandedModportPortType::Resolved(declaration) => {
+                                for dimension in &declaration.unpacked_expr {
+                                    self.space(1);
+                                    self.duplicated_token(
+                                        &port
+                                            .identifier
+                                            .replace(&format!("[{}]", dimension.to_sv_expr())),
+                                    );
+                                }
+                            }
                         }
                         self.align_finish(align_kind::ARRAY);
 
@@ -6064,60 +6436,13 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'FunctionDeclaration'
     fn function_declaration(&mut self, arg: &FunctionDeclaration) {
+        let frames = self.take_function_emission_frames(arg.identifier.identifier_token.token.id);
         let symbol = symbol_table::resolve(arg.identifier.as_ref()).unwrap();
-        let maps = self.get_generic_maps(&symbol.found);
-
-        for (i, map) in maps.iter().enumerate() {
-            if i != 0 {
-                self.newline();
-            }
-            self.push_generic_map(map.clone());
-
-            if let SymbolKind::Function(ref x) = symbol.found.kind {
-                let modport_ports_table = ExpandedModportPortTable::create(
-                    &x.ports,
-                    &self.get_generic_map(),
-                    &arg.identifier.identifier_token,
-                    &symbol.found.namespace,
-                    true,
-                    &self.into(),
-                );
-                if !modport_ports_table.is_empty() {
-                    self.modport_ports_table = Some(modport_ports_table);
-                }
-            }
-
-            self.emit_generic_instance_name_comment(map);
-            self.function(&arg.function);
-            self.space(1);
-            self.str("automatic");
-            self.space(1);
-            if let Some(ref x) = arg.function_declaration_opt1 {
-                self.emit_scalar_type(&x.scalar_type, false);
-            } else {
-                self.str("void");
-            }
-            self.space(1);
-            if map.generic() {
-                self.emit_generic_instance_name(&arg.identifier.identifier_token, map, true);
-            } else {
-                self.identifier(&arg.identifier);
-            }
-            if let Some(ref x) = arg.function_declaration_opt0 {
-                self.port_declaration(&x.port_declaration);
-                self.space(1);
-            }
-            if let Some(ref x) = arg.function_declaration_opt1 {
-                self.token(&x.minus_g_t.minus_g_t_token.replace(""));
-            }
-            self.str(";");
-            self.emit_statement_block(&arg.statement_block, "", "endfunction");
-
-            self.pop_generic_map();
-            self.align_reset();
-        }
-
-        self.modport_ports_table = None;
+        let contexts = frames
+            .into_iter()
+            .map(|frame| (frame.emission_context().generic_map.clone(), Some(frame)))
+            .collect();
+        self.emit_function_declaration(arg, &symbol.found, contexts);
     }
 
     /// Semantic action for non-terminal 'ImportDeclaration'
@@ -6146,6 +6471,10 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'ModuleDeclaration'
     fn module_declaration(&mut self, arg: &ModuleDeclaration) {
+        let frames = self.take_emission_frames(
+            arg.identifier.identifier_token.token.id,
+            EmissionOwnerKind::Module,
+        );
         let symbol = symbol_table::resolve(arg.identifier.as_ref()).unwrap();
         let ports = if let SymbolKind::Module(ref x) = symbol.found.kind {
             // Native test modules don't need SV output (simulator runs them directly via IR)
@@ -6161,22 +6490,32 @@ impl VerylWalker for Emitter {
         let empty_header =
             arg.module_declaration_opt1.is_none() && arg.module_declaration_opt2.is_none();
 
-        let maps = self.get_generic_maps(&symbol.found);
-        for (i, map) in maps.iter().enumerate() {
+        for (i, frame) in frames.into_iter().enumerate() {
             if i != 0 {
                 self.newline();
             }
+            self.emission_frame = Some(frame);
+            let map = &frame.emission_context().generic_map;
             self.push_generic_map(map.clone());
 
-            let modport_ports_table = ExpandedModportPortTable::create(
+            let modport_ports_table = match ExpandedModportPortTable::create(
                 &ports,
                 &self.get_generic_map(),
                 &arg.identifier.identifier_token,
                 &symbol.found.namespace,
                 false,
                 &self.into(),
-            );
-            if !modport_ports_table.is_empty() {
+                Some(frame),
+            ) {
+                Ok(table) => Some(table),
+                Err(invariant) => {
+                    self.record_emission_error(invariant, arg.identifier.identifier_token.token.id);
+                    None
+                }
+            };
+            if let Some(modport_ports_table) = modport_ports_table
+                && !modport_ports_table.is_empty()
+            {
                 self.modport_ports_table = Some(modport_ports_table);
             }
 
@@ -6194,6 +6533,7 @@ impl VerylWalker for Emitter {
                 );
                 self.veryl_token(&arg.identifier.identifier_token.replace(&text));
             }
+            self.emit_connected_declaration_suffix(frame.emission_context());
 
             let mut import_declarations = self.file_scope_import.clone();
             import_declarations.append(&mut arg.collect_import_declarations());
@@ -6239,7 +6579,10 @@ impl VerylWalker for Emitter {
             self.newline_list_post(arg.module_declaration_list.is_empty());
             self.token(&arg.r_brace.r_brace_token.replace("endmodule"));
 
+            self.modport_ports_table = None;
+
             self.pop_generic_map();
+            self.emission_frame = None;
             self.align_reset();
         }
 
@@ -6270,14 +6613,19 @@ impl VerylWalker for Emitter {
 
     /// Semantic action for non-terminal 'InterfaceDeclaration'
     fn interface_declaration(&mut self, arg: &InterfaceDeclaration) {
+        let frames = self.take_emission_frames(
+            arg.identifier.identifier_token.token.id,
+            EmissionOwnerKind::Interface,
+        );
         let symbol = symbol_table::resolve(arg.identifier.as_ref()).unwrap();
         let empty_header = arg.interface_declaration_opt1.is_none();
 
-        let maps = self.get_generic_maps(&symbol.found);
-        for (i, map) in maps.iter().enumerate() {
+        for (i, frame) in frames.into_iter().enumerate() {
             if i != 0 {
                 self.newline();
             }
+            self.emission_frame = Some(frame);
+            let map = &frame.emission_context().generic_map;
             self.push_generic_map(map.clone());
 
             self.emit_generic_instance_name_comment(map);
@@ -6294,6 +6642,7 @@ impl VerylWalker for Emitter {
                 );
                 self.veryl_token(&arg.identifier.identifier_token.replace(&text));
             }
+            self.emit_connected_declaration_suffix(frame.emission_context());
 
             let mut import_declarations = self.file_scope_import.clone();
             import_declarations.append(&mut arg.collect_import_declarations());
@@ -6314,11 +6663,6 @@ impl VerylWalker for Emitter {
                 }
                 self.with_parameter(&x.with_parameter);
             }
-            let forwarding = self.collect_nested_interface_forwarding(
-                &arg.interface_declaration_list,
-                &symbol.found.namespace,
-            );
-            self.nested_interface_forwarding.push(forwarding);
             self.token_will_push(&arg.l_brace.l_brace_token.replace(";"));
             for (i, x) in arg.interface_declaration_list.iter().enumerate() {
                 self.newline_list(i);
@@ -6333,9 +6677,8 @@ impl VerylWalker for Emitter {
             self.emit_global_functions(&symbol.found);
             self.newline_list_post(arg.interface_declaration_list.is_empty());
             self.token(&arg.r_brace.r_brace_token.replace("endinterface"));
-            self.nested_interface_forwarding.pop();
-
             self.pop_generic_map();
+            self.emission_frame = None;
             self.align_reset();
         }
     }
@@ -6539,6 +6882,28 @@ impl VerylWalker for Emitter {
                 self.newline();
             }
             self.push_generic_map(map.clone());
+            #[cfg(test)]
+            if self.package_scope_fault {
+                self.record_emission_error(
+                    NestedModportAnalysisInvariant::PackageScopeMismatch,
+                    arg.identifier.identifier_token.token.id,
+                );
+            }
+            let package_scope_map = map.clone();
+            self.package_emission_scope = match self.prepared_emission.as_ref().map(|prepared| {
+                prepared.package_scope(
+                    arg.identifier.identifier_token.token.id,
+                    symbol.found.id,
+                    &package_scope_map,
+                )
+            }) {
+                Some(Ok(scope)) => scope,
+                Some(Err(invariant)) => {
+                    self.record_emission_error(invariant, arg.identifier.identifier_token.token.id);
+                    None
+                }
+                None => None,
+            };
 
             self.emit_generic_instance_name_comment(map);
             self.package(&arg.package);
@@ -6572,6 +6937,7 @@ impl VerylWalker for Emitter {
             self.token(&arg.r_brace.r_brace_token.replace("endpackage"));
 
             self.pop_generic_map();
+            self.package_emission_scope = None;
             self.align_reset();
         }
     }
@@ -6770,8 +7136,8 @@ pub struct SymbolContext {
     pub bound_namespace: Option<Namespace>,
 }
 
-impl From<&mut Emitter> for SymbolContext {
-    fn from(value: &mut Emitter) -> Self {
+impl From<&mut Emitter<'_>> for SymbolContext {
+    fn from(value: &mut Emitter<'_>) -> Self {
         let generic_map = if let Some(maps) = value.generic_map.last() {
             maps.clone()
         } else {
@@ -7150,7 +7516,7 @@ fn identifier_token_with_prefix_suffix(
     }
 }
 
-fn emitting_identifier_token(token: &VerylToken, symbol: Option<&Symbol>) -> VerylToken {
+pub(crate) fn emitting_identifier_token(token: &VerylToken, symbol: Option<&Symbol>) -> VerylToken {
     let (prefix, suffix) = if let Some(symbol) = symbol {
         get_variable_prefix_suffix(symbol)
     } else {

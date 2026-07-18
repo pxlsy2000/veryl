@@ -11,6 +11,9 @@ const PACKAGE_SELF_REF_TESTS: [&str; 2] = ["84_package_self_ref_1", "84_package_
 static DEPENDENCY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+mod direct_modport_characterization;
+
+#[cfg(test)]
 mod parser {
     use std::fs;
     use veryl_parser::Parser;
@@ -285,12 +288,17 @@ mod emitter {
             let analyzer = Analyzer::new(&metadata);
             let _ = analyzer.analyze_pass2(&result.veryl, &mut context, None);
         }
+        let analysis = context
+            .finish_nested_modport_analysis()
+            .expect("golden analysis must finalize");
 
         for (i, (input, result)) in parse_results.iter().enumerate() {
             let (src, dst, map) = &file_paths[i];
 
             let mut emitter = Emitter::new(&metadata, src, dst, map);
-            emitter.emit(&result.veryl, input);
+            emitter
+                .emit(&result.veryl, input, analysis.as_ref())
+                .expect("golden emission must succeed");
 
             let out_code = emitter.as_str();
             let ref_code = fs::read_to_string(dst).unwrap();
@@ -410,6 +418,29 @@ mod error {
                             }
                         }
                     }
+                }
+
+                if name == "invalid_modport_item" {
+                    const RUNTIME_START_HEAD_RAW_REPORT: &str = concat!(
+                        r#"invalid_modport_item (https://doc.veryl-lang.org/book/07_appendix/02_semantic_error.html#invalid_modport_item)
+
+  × "a" is not a valid modport item: function
+   ╭─[../../testcases/error/invalid_modport_item.veryl:4:9]
+ 3 │     modport m {
+ 4 │         a: import,
+   ·         ┬
+   ·         ╰── Error location
+ 5 │     }
+   ╰────
+"#,
+                        "  help: \n"
+                    );
+                    assert_eq!(out, RUNTIME_START_HEAD_RAW_REPORT);
+                    out = out.replacen(
+                        "  × \"a\" is not a valid modport item: function\n",
+                        "  × \"a\" is not a function\n",
+                        1,
+                    );
                 }
 
                 let mut settings = Settings::clone_current();

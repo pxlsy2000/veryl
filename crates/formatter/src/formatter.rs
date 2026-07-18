@@ -2097,20 +2097,16 @@ impl VerylWalker for Formatter {
 
     /// Semantic action for non-terminal 'ModportItem'
     fn modport_item(&mut self, arg: &ModportItem) {
+        self.align_start(align_kind::IDENTIFIER);
         self.identifier(&arg.modport_item_path.identifier);
         for x in &arg.modport_item_path.modport_item_path_list {
             self.dot(&x.dot);
             self.identifier(&x.identifier);
         }
+        self.align_finish(align_kind::IDENTIFIER);
         self.colon(&arg.colon);
         self.space(1);
-        match arg.direction.as_ref() {
-            Direction::Input(x) => self.input(&x.input),
-            Direction::Output(x) => self.output(&x.output),
-            Direction::Inout(x) => self.inout(&x.inout),
-            Direction::Modport(x) => self.modport(&x.modport),
-            Direction::Import(x) => self.import(&x.import),
-        }
+        self.direction(&arg.direction);
     }
 
     /// Semantic action for non-terminal 'EnumDeclaration'

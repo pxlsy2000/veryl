@@ -7,17 +7,65 @@ use crate::ir::{
     VarSelect, Variable, VariableInfo,
 };
 use crate::namespace::Namespace;
+use crate::nested_modport::{
+    AnalysisSessionHandle, AnalysisSessionId, ComponentCacheKey, ComponentSpecializationIdentity,
+    ConnectedInterfaceSpecialization, EmissionOwnerKind, EmissionSpecializationContext,
+    ExpandedPortKey, InstantiatedTerminalIndex, InstantiationContextKey, LoweringAvailability,
+    NestedModportAnalysisInvariant, NestedModportLowering, NestedModportLoweringKey,
+    OccurrenceKind, OccurrenceRewriteKey, PendingComponentLowering, PendingExpandedPortCandidate,
+    PendingGenericEmissionOwner, PendingInstantiationContextCandidate, PendingModportDeclaration,
+    PendingNestedModportAnalysis, PendingPathRewriteCandidate,
+};
 use crate::scope;
-use crate::symbol::{Affiliation, ClockDomain, Direction, GenericMap, SymbolId};
+use crate::symbol::{
+    Affiliation, ClockDomain, Direction, GenericMap, Symbol, SymbolId, SymbolKind,
+};
 use crate::symbol_path::GenericSymbolPath;
+use crate::symbol_table;
 use crate::value::MaskCache;
 use crate::{HashMap, HashSet};
 use miette::Result;
-use std::sync::{Arc, Mutex};
-use veryl_parser::resource_table::StrId;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+use veryl_parser::resource_table::{PathId, StrId, TokenId};
 use veryl_parser::token_range::TokenRange;
 use veryl_parser::veryl_grammar_trait::{ComponentInstantiation, Identifier};
 use veryl_parser::veryl_token::Token;
+
+#[cfg(test)]
+thread_local! {
+    static NESTED_SIGNATURE_INDEX_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static NESTED_SIGNATURE_LINEAR_SCAN_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORCE_NESTED_SIGNATURE_LINEAR_SCAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn reset_nested_signature_lookup_work() {
+    NESTED_SIGNATURE_INDEX_PROBES.set(0);
+    NESTED_SIGNATURE_LINEAR_SCAN_WORK.set(0);
+}
+
+#[cfg(test)]
+fn nested_signature_lookup_work() -> (usize, usize) {
+    (
+        NESTED_SIGNATURE_INDEX_PROBES.get(),
+        NESTED_SIGNATURE_LINEAR_SCAN_WORK.get(),
+    )
+}
+
+#[cfg(test)]
+fn record_nested_signature_linear_scan_work() {
+    NESTED_SIGNATURE_LINEAR_SCAN_WORK
+        .set(NESTED_SIGNATURE_LINEAR_SCAN_WORK.get().saturating_add(1));
+}
+
+#[cfg(test)]
+fn record_nested_signature_index_probe() {
+    NESTED_SIGNATURE_INDEX_PROBES.set(NESTED_SIGNATURE_INDEX_PROBES.get().saturating_add(1));
+}
+
+#[cfg(not(test))]
+fn record_nested_signature_index_probe() {}
 
 #[derive(Clone)]
 pub struct Config {
@@ -46,6 +94,8 @@ impl Default for Config {
 
 #[derive(Default)]
 pub struct Context {
+    analysis_session: AnalysisSessionHandle,
+    pending_nested_modport_analysis: SharedPendingNestedModportAnalysis,
     pub config: Config,
     pub var_id: VarId,
     pub var_paths: HashMap<VarPath, (VarId, Comptime)>,
@@ -55,17 +105,25 @@ pub struct Context {
     /// re-entry is detected and the IR conversion doesn't overflow.
     pub converting_funcs: Vec<SymbolId>,
     pub variables: HashMap<VarId, Variable>,
+    instantiated_terminal_index: InstantiatedTerminalIndex,
+    nested_signatures_by_head: HashMap<StrId, BTreeMap<VarId, Signature>>,
+    nested_signature_heads: HashMap<VarId, StrId>,
     pub functions: HashMap<VarId, Function>,
     pub port_types: HashMap<VarPath, (Type, ClockDomain)>,
     pub modports: HashMap<StrId, Vec<(ModportMemberPath, Direction)>>,
-    nested_modport_flat_names: HashMap<String, ModportMemberPath>,
-    nested_modport_flat_name_scopes: Vec<HashMap<String, ModportMemberPath>>,
+    pending_component_lowering: PendingComponentLowering,
     pub declarations: Vec<Declaration>,
     pub default_clock: Option<(VarPath, SymbolId)>,
     pub default_reset: Option<(VarPath, SymbolId)>,
     pub inst_signatures: HashMap<StrId, Signature>,
     pub modport_signatures: Vec<HashMap<StrId, Signature>>,
     pub instance_history: InstanceHistory,
+    component_specializations: Vec<ComponentSpecializationIdentity>,
+    component_modport_signature_depths: Vec<usize>,
+    emission_owner_signature: Option<Signature>,
+    component_emission_specialization: Option<ComponentSpecializationIdentity>,
+    function_emission_owner_signature: Option<Signature>,
+    function_rewrite_target: Option<ComponentSpecializationIdentity>,
     /// Recursion depth of `eval_factor_path`, bounded by `function_instance_depth_limit`.
     pub function_eval_depth: usize,
     /// Recorded when `function_eval_depth`'s limit is hit, since the eval path
@@ -117,12 +175,409 @@ pub struct Context {
     project_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SharedPendingNestedModportAnalysis(Arc<Mutex<PendingNestedModportAnalysis>>);
+
+impl SharedPendingNestedModportAnalysis {
+    fn lock(
+        &self,
+    ) -> std::result::Result<
+        MutexGuard<'_, PendingNestedModportAnalysis>,
+        NestedModportAnalysisInvariant,
+    > {
+        self.0
+            .lock()
+            .map_err(|_| NestedModportAnalysisInvariant::PendingStatePoisoned)
+    }
+
+    #[cfg(test)]
+    fn shared(&self) -> Arc<Mutex<PendingNestedModportAnalysis>> {
+        Arc::clone(&self.0)
+    }
+}
+
 impl Context {
+    #[cfg(test)]
+    pub(crate) fn reset_nested_signature_lookup_work() {
+        reset_nested_signature_lookup_work();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn nested_signature_lookup_work() -> (usize, usize) {
+        nested_signature_lookup_work()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_nested_signature_linear_scan(force: bool) {
+        FORCE_NESTED_SIGNATURE_LINEAR_SCAN.set(force);
+    }
+
+    pub fn child(&self) -> Self {
+        Self {
+            analysis_session: self.analysis_session.clone(),
+            pending_nested_modport_analysis: self.pending_nested_modport_analysis.clone(),
+            ..Self::default()
+        }
+    }
+
+    pub fn analysis_session_id(&self) -> AnalysisSessionId {
+        self.analysis_session.id()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn analysis_session_allocation_count(&self) -> usize {
+        self.analysis_session.allocation_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_nested_modport_analysis(
+        &self,
+    ) -> Arc<Mutex<PendingNestedModportAnalysis>> {
+        self.pending_nested_modport_analysis.shared()
+    }
+
+    pub(crate) fn record_nested_generic_emission_owner(
+        &self,
+        owner: PendingGenericEmissionOwner,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        self.pending_nested_modport_analysis
+            .lock()?
+            .record_generic_emission_owner(owner);
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_lowering(
+        &self,
+        key: NestedModportLoweringKey,
+        availability: LoweringAvailability,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        self.pending_nested_modport_analysis
+            .lock()?
+            .record_lowering(key, availability);
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_interface_lowering(
+        &self,
+        key: NestedModportLoweringKey,
+        lowering: Arc<NestedModportLowering>,
+    ) -> std::result::Result<Arc<NestedModportLowering>, NestedModportAnalysisInvariant> {
+        Ok(self
+            .pending_nested_modport_analysis
+            .lock()?
+            .record_interface_lowering(key, lowering))
+    }
+
+    pub(crate) fn set_nested_emission_owner_parent(
+        &self,
+        specialization: &NestedModportLoweringKey,
+        parent: Option<ComponentSpecializationIdentity>,
+        namespace_parent_fallback: bool,
+        enclosing_generic_map: Option<GenericMap>,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        self.pending_nested_modport_analysis
+            .lock()?
+            .set_emission_owner_parent(
+                specialization,
+                parent.map(Arc::new),
+                namespace_parent_fallback,
+                enclosing_generic_map,
+            );
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_path_candidate(
+        &self,
+        kind: OccurrenceKind,
+        token: TokenRange,
+        path: &[StrId],
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        if self.in_generic {
+            return Ok(());
+        }
+        let Some(owner_specialization) = self.emission_owner_specialization() else {
+            return Ok(());
+        };
+        let Some((head, semantic_segments)) = path.split_first() else {
+            return Ok(());
+        };
+        let connected_target = self
+            .modport_signatures
+            .last()
+            .and_then(|signatures| signatures.get(head))
+            .or_else(|| self.inst_signatures.get(head))
+            .cloned()
+            .or_else(|| {
+                let path = VarPath::new(*head);
+                let (id, _) = self.var_paths.get(&path)?;
+                self.variables.get(id)?.r#type.kind.signature()
+            })
+            .or_else(|| self.nested_signature_for_head(*head))
+            .or_else(|| {
+                self.port_types
+                    .get(&VarPath::new(*head))
+                    .and_then(|(r#type, _)| r#type.kind.signature())
+            });
+        let Some(connected_target) = connected_target else {
+            return Ok(());
+        };
+        if semantic_segments.is_empty() {
+            return Ok(());
+        }
+        let owner = NestedModportLoweringKey {
+            session: self.analysis_session_id(),
+            specialization: (owner_specialization).into(),
+        };
+        let (target, semantic_segments) = if self.affiliation.contains(&Affiliation::Interface) {
+            let target = self
+                .function_rewrite_target
+                .clone()
+                .map(|specialization| NestedModportLoweringKey {
+                    session: self.analysis_session_id(),
+                    specialization: specialization.into(),
+                })
+                .unwrap_or_else(|| owner.clone());
+            (target, path)
+        } else {
+            (
+                NestedModportLoweringKey {
+                    session: self.analysis_session_id(),
+                    specialization:
+                        (ComponentSpecializationIdentity::from_unique_connected_actuals(
+                            connected_target,
+                            [],
+                        ))
+                        .into(),
+                },
+                semantic_segments,
+            )
+        };
+        let candidate = PendingPathRewriteCandidate {
+            target,
+            semantic_segments: semantic_segments.to_vec(),
+            replace_from_segment: 0,
+            consumed_segments: path.len(),
+        };
+        self.pending_nested_modport_analysis
+            .lock()?
+            .record_optional_rewrite_candidate(
+                OccurrenceRewriteKey {
+                    owner,
+                    kind,
+                    token: token.beg.id,
+                },
+                candidate,
+                token,
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_expanded_port_candidate(
+        &self,
+        token: TokenId,
+        target_signature: &Signature,
+        modport: StrId,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        if self.in_generic {
+            return Ok(());
+        }
+        let Some(owner_specialization) = self.emission_owner_specialization() else {
+            return Ok(());
+        };
+        let owner = NestedModportLoweringKey {
+            session: self.analysis_session_id(),
+            specialization: (owner_specialization).into(),
+        };
+        let target = NestedModportLoweringKey {
+            session: self.analysis_session_id(),
+            specialization: (ComponentSpecializationIdentity::from_unique_connected_actuals(
+                target_signature.clone(),
+                [],
+            ))
+            .into(),
+        };
+        self.pending_nested_modport_analysis
+            .lock()?
+            .record_expanded_port_candidate(
+                ExpandedPortKey { owner, token },
+                PendingExpandedPortCandidate { target, modport },
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_instantiation_context_candidate(
+        &self,
+        token: TokenId,
+        owner_specialization: ComponentSpecializationIdentity,
+        target: ComponentSpecializationIdentity,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        if self.in_generic {
+            return Ok(());
+        }
+        if target.connected_actuals.is_empty() {
+            return Ok(());
+        }
+        let owner = NestedModportLoweringKey {
+            session: self.analysis_session_id(),
+            specialization: (owner_specialization).into(),
+        };
+        let target = NestedModportLoweringKey {
+            session: self.analysis_session_id(),
+            specialization: (target).into(),
+        };
+        self.pending_nested_modport_analysis
+            .lock()?
+            .record_instantiation_context_candidate(
+                InstantiationContextKey { owner, token },
+                PendingInstantiationContextCandidate { target },
+            )?;
+        Ok(())
+    }
+
+    pub(crate) fn record_nested_emission_owner(
+        &self,
+        source: PathId,
+        declaration: TokenId,
+        kind: EmissionOwnerKind,
+        specialization: NestedModportLoweringKey,
+        lowering: LoweringAvailability,
+    ) -> std::result::Result<(), NestedModportAnalysisInvariant> {
+        let emission_context = EmissionSpecializationContext::from_specialization(
+            kind,
+            &specialization.specialization,
+        )?;
+        let mut pending = self.pending_nested_modport_analysis.lock()?;
+        pending.record_emission_owner(
+            source,
+            declaration,
+            kind,
+            specialization,
+            emission_context,
+            lowering,
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_nested_modport_analysis(
+        &mut self,
+    ) -> std::result::Result<Arc<crate::nested_modport::NestedModportAnalysis>, AnalyzerError> {
+        let mut pending = self
+            .pending_nested_modport_analysis
+            .lock()
+            .map_err(AnalyzerError::from)?;
+        pending
+            .finalize(self.analysis_session_id())
+            .map_err(AnalyzerError::from)
+    }
+
+    pub fn component_specialization_identity(
+        &self,
+        owner: &Signature,
+    ) -> ComponentSpecializationIdentity {
+        if self.get_current_signature() == Some(owner)
+            && let Some(identity) = self.component_specializations.last()
+        {
+            return identity.clone();
+        }
+        self.next_component_specialization_identity(owner)
+    }
+
+    pub(crate) fn connected_component_specialization_identity(
+        &self,
+        owner: &Signature,
+    ) -> ComponentSpecializationIdentity {
+        self.next_component_specialization_identity(owner)
+    }
+
+    pub(crate) fn set_emission_owner_signature(&mut self, owner: Signature) {
+        self.emission_owner_signature = Some(owner);
+    }
+
+    pub(crate) fn set_component_emission_specialization(
+        &mut self,
+        specialization: ComponentSpecializationIdentity,
+    ) {
+        self.component_emission_specialization = Some(specialization);
+    }
+
+    pub(crate) fn component_emission_specialization(
+        &self,
+    ) -> Option<ComponentSpecializationIdentity> {
+        self.component_emission_specialization.clone()
+    }
+
+    pub(crate) fn replace_function_emission_owner_signature(
+        &mut self,
+        owner: Option<Signature>,
+    ) -> Option<Signature> {
+        std::mem::replace(&mut self.function_emission_owner_signature, owner)
+    }
+
+    pub(crate) fn replace_function_rewrite_target(
+        &mut self,
+        target: Option<ComponentSpecializationIdentity>,
+    ) -> Option<ComponentSpecializationIdentity> {
+        std::mem::replace(&mut self.function_rewrite_target, target)
+    }
+
+    fn emission_owner_specialization(&self) -> Option<ComponentSpecializationIdentity> {
+        self.function_emission_owner_signature
+            .as_ref()
+            .or_else(|| self.get_current_signature())
+            .or(self.emission_owner_signature.as_ref())
+            .map(|owner| self.component_specialization_identity(owner))
+    }
+
+    pub(crate) fn current_emission_owner_specialization(
+        &self,
+    ) -> Option<ComponentSpecializationIdentity> {
+        self.emission_owner_specialization()
+    }
+
+    fn next_component_specialization_identity(
+        &self,
+        owner: &Signature,
+    ) -> ComponentSpecializationIdentity {
+        let inherited_depth = self
+            .component_modport_signature_depths
+            .last()
+            .copied()
+            .unwrap_or(0);
+        let connected_actuals = self
+            .modport_signatures
+            .last()
+            .filter(|_| self.modport_signatures.len() > inherited_depth)
+            .into_iter()
+            .flat_map(|signatures| signatures.iter())
+            .map(|(formal_port, actual)| ConnectedInterfaceSpecialization {
+                formal_port: *formal_port,
+                actual: actual.clone(),
+            });
+        ComponentSpecializationIdentity::from_unique_connected_actuals(
+            owner.clone(),
+            connected_actuals,
+        )
+    }
+
+    fn component_cache_key(&self, owner: &Signature) -> ComponentCacheKey {
+        ComponentCacheKey(self.next_component_specialization_identity(owner))
+    }
+
     pub fn inherit(&mut self, tgt: &mut Context) {
+        self.analysis_session = tgt.analysis_session.clone();
+        self.pending_nested_modport_analysis = tgt.pending_nested_modport_analysis.clone();
         std::mem::swap(&mut self.overrides, &mut tgt.overrides);
         std::mem::swap(&mut self.generic_maps, &mut tgt.generic_maps);
         std::mem::swap(&mut self.modport_signatures, &mut tgt.modport_signatures);
         std::mem::swap(&mut self.instance_history, &mut tgt.instance_history);
+        std::mem::swap(
+            &mut self.component_specializations,
+            &mut tgt.component_specializations,
+        );
+        std::mem::swap(
+            &mut self.component_modport_signature_depths,
+            &mut tgt.component_modport_signature_depths,
+        );
         std::mem::swap(&mut self.function_eval_depth, &mut tgt.function_eval_depth);
         std::mem::swap(
             &mut self.function_eval_overflow,
@@ -228,7 +683,60 @@ impl Context {
         if !hier.is_empty() {
             variable.path.add_prelude(hier);
         }
+        self.insert_prepared_variable(id, variable);
+    }
+
+    pub(crate) fn insert_prepared_variable(&mut self, id: VarId, variable: Variable) {
+        self.remove_nested_signature(id);
+        if let (Some(head), Some(signature)) =
+            (variable.path.0.first(), variable.r#type.kind.signature())
+        {
+            self.nested_signatures_by_head
+                .entry(*head)
+                .or_default()
+                .insert(id, signature);
+            self.nested_signature_heads.insert(id, *head);
+        }
+        self.instantiated_terminal_index
+            .insert_variable(id, &variable);
         self.variables.insert(id, variable);
+    }
+
+    pub(crate) fn remove_variable(&mut self, id: &VarId) -> Option<Variable> {
+        self.remove_nested_signature(*id);
+        self.instantiated_terminal_index.remove_variable(*id);
+        self.variables.remove(id)
+    }
+
+    fn remove_nested_signature(&mut self, id: VarId) {
+        let Some(head) = self.nested_signature_heads.remove(&id) else {
+            return;
+        };
+        let empty = self
+            .nested_signatures_by_head
+            .get_mut(&head)
+            .is_some_and(|signatures| {
+                signatures.remove(&id);
+                signatures.is_empty()
+            });
+        if empty {
+            self.nested_signatures_by_head.remove(&head);
+        }
+    }
+
+    fn nested_signature_for_head(&self, head: StrId) -> Option<Signature> {
+        record_nested_signature_index_probe();
+        #[cfg(test)]
+        if FORCE_NESTED_SIGNATURE_LINEAR_SCAN.get() {
+            for _ in self.variables.values() {
+                record_nested_signature_linear_scan_work();
+            }
+        }
+        self.nested_signatures_by_head
+            .get(&head)?
+            .values()
+            .next()
+            .cloned()
     }
 
     pub fn insert_port_type(&mut self, path: VarPath, r#type: Type, clock_domain: ClockDomain) {
@@ -244,6 +752,12 @@ impl Context {
         if !hier.is_empty() {
             function.path.add_prelude(hier);
         }
+        self.insert_prepared_function(id, function);
+    }
+
+    fn insert_prepared_function(&mut self, id: VarId, function: Function) {
+        self.instantiated_terminal_index
+            .insert_function(id, &function);
         self.functions.insert(id, function);
     }
 
@@ -289,33 +803,17 @@ impl Context {
         self.modports.insert(name, members);
     }
 
-    pub fn with_nested_modport_flat_name_scope<F, T>(&mut self, f: F) -> IrResult<T>
-    where
-        F: FnOnce(&mut Context) -> IrResult<T>,
-    {
-        self.nested_modport_flat_name_scopes
-            .push(std::mem::take(&mut self.nested_modport_flat_names));
-        let ret = f(self);
-        self.nested_modport_flat_names = self
-            .nested_modport_flat_name_scopes
-            .pop()
-            .unwrap_or_default();
-        ret
-    }
-
-    pub fn nested_modport_flat_name(&self, name: &str) -> Option<&ModportMemberPath> {
-        self.nested_modport_flat_names.get(name)
-    }
-
-    pub fn insert_nested_modport_flat_name(&mut self, name: String, path: ModportMemberPath) {
-        self.nested_modport_flat_names.insert(name, path);
+    pub fn insert_pending_modport(&mut self, declaration: PendingModportDeclaration) {
+        self.pending_component_lowering
+            .declarations
+            .push(declaration);
     }
 
     pub fn extract_function(&mut self, context: &mut Context, base: &VarPath, array: &ShapeRef) {
-        for (id, mut variable) in context.variables.drain() {
+        for (id, mut variable) in context.drain_variables() {
             variable.path.add_prelude(&base.0);
             variable.prepend_array(array);
-            self.variables.insert(id, variable);
+            self.insert_prepared_variable(id, variable);
         }
 
         for (mut path, id) in context.func_paths.drain() {
@@ -342,7 +840,7 @@ impl Context {
             if !function.path.path.starts_with(&base.0) {
                 function.path.path.add_prelude(&base.0);
             }
-            self.functions.insert(id, function);
+            self.insert_prepared_function(id, function);
         }
     }
 
@@ -373,17 +871,24 @@ impl Context {
     ) {
         let mut inserted = HashSet::default();
 
-        let modport_members = if let Some(x) = &modport {
-            component.get_modport(x)
-        } else {
-            HashMap::default()
-        };
+        let Interface {
+            variables,
+            var_paths,
+            modports,
+            ..
+        } = component;
+
+        let modport_members = modport.as_ref().and_then(|name| modports.get_modport(name));
 
         let mut id_map = HashMap::default();
-        for mut variable in component.variables.into_values() {
+        for mut variable in variables.into_values() {
             if modport.is_some() {
-                if let Some(x) = modport_members.iter().find_map(|(path, direction)| {
-                    path.strip_prefix(&variable.path.0).map(|_| direction)
+                if let Some(x) = modport_members.and_then(|members| {
+                    members
+                        .iter_paths_directions()
+                        .find_map(|(path, direction)| {
+                            path.strip_prefix(&variable.path.0).map(|_| direction)
+                        })
                 }) {
                     variable.kind = match x {
                         Direction::Input => VarKind::Input,
@@ -416,7 +921,7 @@ impl Context {
         }
 
         // import non-variable VarPath
-        for (mut path, (id, mut comptime)) in component.var_paths {
+        for (mut path, (id, mut comptime)) in var_paths {
             if !inserted.contains(&path) {
                 path.add_prelude(&[base]);
                 comptime.r#type.prepend_array(array);
@@ -488,14 +993,25 @@ impl Context {
         self.inst_signatures.insert(identifier.text(), sig.clone());
     }
 
-    pub fn collect_modport_signatures(&mut self, inst: &ComponentInstantiation) {
+    pub fn collect_modport_signatures(&mut self, inst: &ComponentInstantiation, symbol: &Symbol) {
         let mut signatures = HashMap::default();
         if !self.inst_signatures.is_empty()
             && let Some(ref opt2) = inst.component_instantiation_opt2
             && let Some(ref port_opt) = opt2.inst_port.inst_port_opt
         {
             let port_items: Vec<_> = port_opt.inst_port_list.as_ref().into();
-            for port_item in &port_items {
+            let formal_ports = match &symbol.kind {
+                SymbolKind::Module(module) => Some(module.ports.clone()),
+                SymbolKind::GenericInstance(instance) => {
+                    symbol_table::get(instance.base).and_then(|base| match base.kind {
+                        SymbolKind::Module(module) => Some(module.ports),
+                        _ => None,
+                    })
+                }
+                _ => None,
+            }
+            .unwrap_or_default();
+            for (index, port_item) in port_items.iter().enumerate() {
                 let inst_name = if let Some(ref x) = port_item.inst_port_item_opt {
                     let Some(identifier) = x.expression.unwrap_identifier().map(|x| x.identifier())
                     else {
@@ -506,8 +1022,14 @@ impl Context {
                     port_item.identifier.text()
                 };
                 if let Some(sig) = self.inst_signatures.get(&inst_name) {
-                    let port_name = port_item.identifier.text();
-                    signatures.insert(port_name, sig.clone());
+                    let port_name = if port_item.inst_port_item_opt.is_some() {
+                        Some(port_item.identifier.text())
+                    } else {
+                        formal_ports.get(index).map(|port| port.name())
+                    };
+                    if let Some(port_name) = port_name {
+                        signatures.insert(port_name, sig.clone());
+                    }
                 }
             }
         }
@@ -548,11 +1070,34 @@ impl Context {
     }
 
     pub fn push_instance_history(&mut self, x: Signature) -> Result<bool, InstanceHistoryError> {
-        self.instance_history.push(x, &self.config)
+        let specialization = self.next_component_specialization_identity(&x);
+        let key = ComponentCacheKey(specialization.clone());
+        let pushed = self.instance_history.push(x, key, &self.config)?;
+        if pushed {
+            self.component_specializations.push(specialization);
+            self.component_modport_signature_depths
+                .push(self.modport_signatures.len());
+        }
+        Ok(pushed)
     }
 
     pub fn pop_instance_history(&mut self) {
         self.instance_history.pop();
+        self.component_specializations.pop();
+        self.component_modport_signature_depths.pop();
+    }
+
+    pub(crate) fn reset_source_traversal_state(&mut self) {
+        self.instance_history.clear_hierarchy();
+        self.component_specializations.clear();
+        self.component_modport_signature_depths.clear();
+        self.generic_maps.clear();
+        self.modport_signatures.clear();
+        self.emission_owner_signature = None;
+        self.component_emission_specialization = None;
+        self.function_emission_owner_signature = None;
+        self.function_rewrite_target = None;
+        self.function_call_stack.clear();
     }
 
     pub fn get_current_signature(&self) -> Option<&Signature> {
@@ -560,15 +1105,21 @@ impl Context {
     }
 
     pub fn get_instance_history(&self, sig: &Signature) -> Option<(Arc<Component>, bool)> {
-        self.instance_history.get(sig)
+        self.instance_history.get(&self.component_cache_key(sig))
     }
 
     pub fn set_instance_history(&mut self, sig: &Signature, component: Arc<Component>) {
-        self.instance_history.set(sig, component, self.in_generic);
+        let key = self
+            .component_specializations
+            .last()
+            .cloned()
+            .map(ComponentCacheKey)
+            .unwrap_or_else(|| self.component_cache_key(sig));
+        self.instance_history.set(&key, component, self.in_generic);
     }
 
     pub fn remove_instance_history(&mut self, sig: &Signature) {
-        self.instance_history.remove(sig);
+        self.instance_history.remove(&self.component_cache_key(sig));
     }
 
     pub fn push_hierarchy(&mut self, x: StrId) {
@@ -621,6 +1172,18 @@ impl Context {
 
     pub fn pop_generic_map(&mut self) {
         self.generic_maps.pop();
+    }
+
+    pub(crate) fn merged_generic_map(&self) -> GenericMap {
+        let mut merged = GenericMap::default();
+        for maps in &self.generic_maps {
+            for map in maps {
+                merged
+                    .map
+                    .extend(map.map.iter().map(|(name, value)| (*name, value.clone())));
+            }
+        }
+        merged
     }
 
     /// Marks `id` as being expanded; returns false if it already is (a cycle).
@@ -682,6 +1245,8 @@ impl Context {
     }
 
     pub fn drain_variables(&mut self) -> HashMap<VarId, Variable> {
+        self.nested_signatures_by_head.clear();
+        self.nested_signature_heads.clear();
         self.variables.drain().collect()
     }
 
@@ -693,8 +1258,22 @@ impl Context {
         self.functions.drain().collect()
     }
 
+    pub(crate) fn drain_instantiated_terminal_index(
+        &mut self,
+        variables: &HashMap<VarId, Variable>,
+        functions: &HashMap<VarId, Function>,
+    ) -> InstantiatedTerminalIndex {
+        let mut index = std::mem::take(&mut self.instantiated_terminal_index);
+        index.retain_records(variables, functions);
+        index
+    }
+
     pub fn drain_modports(&mut self) -> HashMap<StrId, Vec<(ModportMemberPath, Direction)>> {
         self.modports.drain().collect()
+    }
+
+    pub fn drain_pending_component_lowering(&mut self) -> PendingComponentLowering {
+        std::mem::take(&mut self.pending_component_lowering)
     }
 
     pub fn drain_declarations(&mut self) -> Vec<Declaration> {
@@ -703,5 +1282,159 @@ impl Context {
 
     pub fn drain_errors(&mut self) -> Vec<AnalyzerError> {
         self.errors.drain(..).collect()
+    }
+}
+
+#[cfg(test)]
+mod pending_state_tests {
+    use super::*;
+
+    fn poisoned_context() -> Result<Context, &'static str> {
+        let context = Context::default();
+        let pending = context.pending_nested_modport_analysis();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = pending
+                .lock()
+                .map_err(|_| "fresh pending mutex should lock")?;
+            panic!("intentional pending-state poison");
+            #[allow(unreachable_code)]
+            Ok::<(), &'static str>(())
+        });
+        if poisoner.join().is_ok() {
+            return Err("pending poisoner should panic");
+        }
+        Ok(context)
+    }
+
+    fn key(context: &Context, symbol: usize) -> NestedModportLoweringKey {
+        NestedModportLoweringKey {
+            session: context.analysis_session_id(),
+            specialization: (ComponentSpecializationIdentity::from_unique_connected_actuals(
+                Signature::new(SymbolId(symbol)),
+                [],
+            ))
+            .into(),
+        }
+    }
+
+    fn assert_poison<T>(
+        result: std::result::Result<T, NestedModportAnalysisInvariant>,
+    ) -> Result<(), &'static str> {
+        if matches!(
+            result,
+            Err(NestedModportAnalysisInvariant::PendingStatePoisoned)
+        ) {
+            Ok(())
+        } else {
+            Err("operation must report PendingStatePoisoned")
+        }
+    }
+
+    #[test]
+    fn shared_pending_lock_maps_poison_to_exact_invariant() -> Result<(), &'static str> {
+        let shared = SharedPendingNestedModportAnalysis::default();
+        let poison_target = shared.shared();
+        let poisoner = std::thread::spawn(move || {
+            let _guard = poison_target
+                .lock()
+                .map_err(|_| "fresh pending mutex should lock")?;
+            panic!("intentional pending-state poison");
+            #[allow(unreachable_code)]
+            Ok::<(), &'static str>(())
+        });
+        assert!(poisoner.join().is_err());
+
+        assert!(matches!(
+            shared.lock(),
+            Err(NestedModportAnalysisInvariant::PendingStatePoisoned)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn every_pending_mutation_reports_poison_without_silent_success() -> Result<(), &'static str> {
+        let context = poisoned_context()?;
+        assert_poison(
+            context.record_nested_generic_emission_owner(PendingGenericEmissionOwner {
+                session: context.analysis_session_id(),
+                source: PathId(1),
+                declaration: TokenId(1),
+                kind: EmissionOwnerKind::Interface,
+                symbol: SymbolId(1),
+            }),
+        )?;
+
+        let context = poisoned_context()?;
+        assert_poison(
+            context.record_nested_lowering(key(&context, 1), LoweringAvailability::NotNested),
+        )?;
+
+        let context = poisoned_context()?;
+        let lowering = Arc::new(NestedModportLowering::new(
+            HashMap::default(),
+            Arc::from([]),
+            HashMap::default(),
+        ));
+        assert_poison(context.record_nested_interface_lowering(key(&context, 1), lowering))?;
+
+        let context = poisoned_context()?;
+        assert_poison(context.set_nested_emission_owner_parent(
+            &key(&context, 1),
+            None,
+            false,
+            Some(GenericMap::default()),
+        ))?;
+
+        let context = poisoned_context()?;
+        assert_poison(context.record_nested_emission_owner(
+            PathId(1),
+            TokenId(1),
+            EmissionOwnerKind::Interface,
+            key(&context, 1),
+            LoweringAvailability::NotNested,
+        ))?;
+        Ok(())
+    }
+
+    #[test]
+    fn every_pending_candidate_reports_poison_without_silent_success() -> Result<(), &'static str> {
+        let mut context = poisoned_context()?;
+        context.emission_owner_signature = Some(Signature::new(SymbolId(1)));
+        context
+            .inst_signatures
+            .insert(StrId(10), Signature::new(SymbolId(2)));
+        let token = Token::from_external_text("candidate");
+        assert_poison(context.record_nested_path_candidate(
+            OccurrenceKind::ExpressionIdentifier,
+            token.into(),
+            &[StrId(10), StrId(11)],
+        ))?;
+
+        let mut context = poisoned_context()?;
+        context.emission_owner_signature = Some(Signature::new(SymbolId(1)));
+        assert_poison(context.record_nested_expanded_port_candidate(
+            TokenId(1),
+            &Signature::new(SymbolId(2)),
+            StrId(3),
+        ))?;
+
+        let context = poisoned_context()?;
+        let owner = ComponentSpecializationIdentity::from_unique_connected_actuals(
+            Signature::new(SymbolId(1)),
+            [],
+        );
+        let target = ComponentSpecializationIdentity::from_unique_connected_actuals(
+            Signature::new(SymbolId(2)),
+            [ConnectedInterfaceSpecialization {
+                formal_port: StrId(3),
+                actual: Signature::new(SymbolId(4)),
+            }],
+        );
+        assert_poison(context.record_nested_instantiation_context_candidate(
+            TokenId(1),
+            owner,
+            target,
+        ))?;
+        Ok(())
     }
 }

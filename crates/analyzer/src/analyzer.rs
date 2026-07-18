@@ -185,6 +185,8 @@ impl Analyzer {
     ) -> Vec<AnalyzerError> {
         let mut ret = Vec::new();
 
+        let _session = context.analysis_session_id();
+
         context.config.retain_component_body = ir.is_some();
         context.config.instance_depth_limit = self.build_opt.instance_depth_limit;
         context.config.instance_total_limit = self.build_opt.instance_total_limit;
@@ -192,7 +194,9 @@ impl Analyzer {
         context.config.evaluate_size_limit = self.build_opt.evaluate_size_limit;
         context.config.evaluate_array_limit = self.build_opt.evaluate_array_limit;
 
+        context.reset_source_traversal_state();
         let mut ir_result = Self::create_ir(context, input);
+        context.reset_source_traversal_state();
         if let Some(x) = ir {
             x.append(&mut ir_result.0);
         }

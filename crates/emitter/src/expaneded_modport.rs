@@ -1,10 +1,15 @@
 use crate::emitter::{SymbolContext, resolve_generic_path, symbol_string};
+use crate::expanded_modport_index::ExpandedModportLookupIndex;
 use std::collections::HashMap;
 use veryl_analyzer::attribute::ExpandItem;
 use veryl_analyzer::attribute_table;
 use veryl_analyzer::conv::{Context, Conv};
 use veryl_analyzer::ir;
 use veryl_analyzer::namespace::Namespace;
+use veryl_analyzer::nested_modport::{
+    EmissionFrame, ExpandedPortResolution, ResolvedDeclarationType, ResolvedExpandedMember,
+    ResolvedExpandedMemberSet, ResolvedExpandedPortInterface,
+};
 use veryl_analyzer::symbol::Direction as SymDirection;
 use veryl_analyzer::symbol::Type as SymType;
 use veryl_analyzer::symbol::{
@@ -16,6 +21,26 @@ use veryl_parser::stringifier::Stringifier;
 use veryl_parser::veryl_grammar_trait::*;
 use veryl_parser::veryl_token::{Token, VerylToken};
 use veryl_parser::veryl_walker::VerylWalker;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DIRECT_INTERFACE_RESOLUTION_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn force_direct_interface_resolution_failure(value: bool) {
+    FORCE_DIRECT_INTERFACE_RESOLUTION_FAILURE.set(value);
+}
+
+#[cfg(test)]
+fn direct_interface_resolution_failure_forced() -> bool {
+    FORCE_DIRECT_INTERFACE_RESOLUTION_FAILURE.get()
+}
+
+#[cfg(not(test))]
+fn direct_interface_resolution_failure_forced() -> bool {
+    false
+}
 
 pub struct ExpandModportConnection {
     pub port_target: VerylToken,
@@ -57,6 +82,48 @@ impl ExpandModportConnections {
             .collect();
         Self { connections }
     }
+
+    fn new_resolved(
+        port: &Port,
+        members: &[ResolvedExpandedMember],
+        interface_name: &VerylToken,
+        array_index: &[isize],
+    ) -> Self {
+        let connections = members
+            .iter()
+            .map(|member| {
+                let emitted_identifier = port.token.replace(&member.identifier.to_string());
+                let (port_target, interface_target) = if array_index.is_empty() {
+                    (
+                        format!("__{}_{}", port.name(), emitted_identifier),
+                        format!("{interface_name}.{emitted_identifier}"),
+                    )
+                } else {
+                    let index: Vec<_> = array_index.iter().map(|x| format!("{x}")).collect();
+                    let select: Vec<_> = array_index.iter().map(|x| format!("[{x}]")).collect();
+                    (
+                        format!(
+                            "__{}_{}_{}",
+                            port.name(),
+                            index.join("_"),
+                            emitted_identifier
+                        ),
+                        format!(
+                            "{}{}.{}",
+                            interface_name,
+                            select.join(""),
+                            emitted_identifier
+                        ),
+                    )
+                };
+                ExpandModportConnection {
+                    port_target: port.token.replace(&port_target),
+                    interface_target: interface_name.replace(&interface_target),
+                }
+            })
+            .collect();
+        Self { connections }
+    }
 }
 
 pub struct ExpandModportConnectionsTableEntry {
@@ -70,7 +137,7 @@ pub struct ExpandModportConnectionsTable {
 }
 
 impl ExpandModportConnectionsTable {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
         }
@@ -81,7 +148,8 @@ impl ExpandModportConnectionsTable {
         inst_ports: &Vec<&InstPortItem>,
         generic_map: &[GenericMap],
         namespace: &Namespace,
-    ) -> Self {
+        frame: Option<EmissionFrame<'_>>,
+    ) -> Result<Self, veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
         fn extract_connected_port(
             inst_port: &InstPortItem,
             defined_ports: &[Port],
@@ -92,7 +160,7 @@ impl ExpandModportConnectionsTable {
                 return None;
             }
 
-            let arg_token = if let Some(opt_item) = &inst_port.inst_port_item_opt {
+            let (port_name, arg_token) = if let Some(opt_item) = &inst_port.inst_port_item_opt {
                 let Some(arg_identifier) = opt_item.expression.unwrap_identifier() else {
                     // Given expression is an operation but not a simple identifier reference.
                     // Such expression is not reference to an interface.
@@ -102,11 +170,17 @@ impl ExpandModportConnectionsTable {
                 let mut stringifier = Stringifier::new();
                 stringifier.expression_identifier(arg_identifier);
 
-                arg_identifier.identifier().replace(stringifier.as_str())
+                (
+                    inst_port.identifier.identifier_token.token.text,
+                    arg_identifier.identifier().replace(stringifier.as_str()),
+                )
             } else {
-                inst_port.identifier.identifier_token.clone()
+                (
+                    defined_ports[i].name(),
+                    inst_port.identifier.identifier_token.clone(),
+                )
             };
-            Some((inst_port.identifier.identifier_token.token.text, arg_token))
+            Some((port_name, arg_token))
         }
 
         let connected_ports: HashMap<StrId, VerylToken> = inst_ports
@@ -122,8 +196,9 @@ impl ExpandModportConnectionsTable {
             generic_map,
             namespace,
             false,
-        );
-        ret
+            frame,
+        )?;
+        Ok(ret)
     }
 
     pub fn create_from_argument_list(
@@ -131,7 +206,8 @@ impl ExpandModportConnectionsTable {
         argument_list: &ArgumentList,
         generic_map: &[GenericMap],
         namespace: &Namespace,
-    ) -> Self {
+        frame: Option<EmissionFrame<'_>>,
+    ) -> Result<Self, veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
         fn extract_connected_port(
             arg: &ArgumentItem,
             defined_ports: &[Port],
@@ -194,8 +270,9 @@ impl ExpandModportConnectionsTable {
             generic_map,
             namespace,
             true,
-        );
-        ret
+            frame,
+        )?;
+        Ok(ret)
     }
 
     fn expand(
@@ -205,7 +282,8 @@ impl ExpandModportConnectionsTable {
         generic_map: &[GenericMap],
         namespace: &Namespace,
         in_function: bool,
-    ) {
+        frame: Option<EmissionFrame<'_>>,
+    ) -> Result<(), veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
         for (modport, port, index) in collect_modports(defined_ports, namespace) {
             if !(in_function || attribute_table::is_expand(&port.token.token, ExpandItem::Modport))
             {
@@ -219,10 +297,27 @@ impl ExpandModportConnectionsTable {
                 array_index.push(vec![]);
             }
 
-            let connected_port = connected_ports.get(&port.name()).unwrap();
+            let Some(connected_port) = connected_ports.get(&port.name()) else {
+                continue;
+            };
+            let resolved_members = match resolved_expanded_port(frame, &port.token.token)? {
+                ResolvedExpandedPort::DirectLegacy => None,
+                ResolvedExpandedPort::Nested { members, .. } => Some(members),
+            };
             let connections: Vec<_> = array_index
                 .iter()
-                .map(|index| ExpandModportConnections::new(&port, &modport, connected_port, index))
+                .map(|index| {
+                    if let Some(members) = resolved_members.as_deref() {
+                        ExpandModportConnections::new_resolved(
+                            &port,
+                            members.members(),
+                            connected_port,
+                            index,
+                        )
+                    } else {
+                        ExpandModportConnections::new(&port, &modport, connected_port, index)
+                    }
+                })
                 .collect();
 
             let entry = ExpandModportConnectionsTableEntry {
@@ -232,6 +327,7 @@ impl ExpandModportConnectionsTable {
             };
             self.entries.push(entry);
         }
+        Ok(())
     }
 
     pub fn remove(&mut self, token: &VerylToken) -> Option<ExpandModportConnectionsTableEntry> {
@@ -255,13 +351,19 @@ impl ExpandModportConnectionsTable {
 
 #[derive(Clone, Debug)]
 pub struct ExpandedModportPort {
-    pub id: StrId,
+    pub source_segments: Vec<StrId>,
     pub array_index: Vec<isize>,
     pub identifier: VerylToken,
-    pub r#type: SymType,
+    pub r#type: ExpandedModportPortType,
     pub interface_target: VerylToken,
     pub direction: SymDirection,
     pub direction_token: VerylToken,
+}
+
+#[derive(Clone, Debug)]
+pub enum ExpandedModportPortType {
+    Direct(SymType),
+    Resolved(ResolvedDeclarationType),
 }
 
 #[derive(Clone, Debug)]
@@ -293,10 +395,10 @@ impl ExpandedModportPorts {
                     port.token.replace("output")
                 };
                 ExpandedModportPort {
-                    id: variable_token.text,
+                    source_segments: vec![variable_token.text],
                     array_index: array_index.to_vec(),
                     identifier: port.token.replace(&port_name),
-                    r#type: variable.r#type.clone(),
+                    r#type: ExpandedModportPortType::Direct(variable.r#type.clone()),
                     interface_target: port.token.replace(&interface_target),
                     direction: *direction,
                     direction_token,
@@ -305,26 +407,105 @@ impl ExpandedModportPorts {
             .collect();
         Self { ports }
     }
+
+    fn new_resolved(
+        port: &Port,
+        members: &[ResolvedExpandedMember],
+        array_index: &[isize],
+    ) -> Self {
+        let ports = members
+            .iter()
+            .map(|member| {
+                let emitted_identifier = port.token.replace(&member.identifier.to_string());
+                let (port_name, interface_target) = if array_index.is_empty() {
+                    (
+                        format!("__{}_{}", port.name(), emitted_identifier),
+                        format!("{}.{}", port.name(), emitted_identifier),
+                    )
+                } else {
+                    let index: Vec<_> = array_index.iter().map(|x| format!("{x}")).collect();
+                    let select: Vec<_> = array_index.iter().map(|x| format!("[{x}]")).collect();
+                    (
+                        format!(
+                            "__{}_{}_{}",
+                            port.name(),
+                            index.join("_"),
+                            emitted_identifier
+                        ),
+                        format!("{}{}.{}", port.name(), select.join(""), emitted_identifier),
+                    )
+                };
+                let direction_text = match member.direction {
+                    SymDirection::Input => "input",
+                    SymDirection::Output => "output",
+                    SymDirection::Inout => "inout",
+                    SymDirection::Import | SymDirection::Modport | SymDirection::Interface => {
+                        "input"
+                    }
+                };
+                ExpandedModportPort {
+                    source_segments: member.source_segments.clone(),
+                    array_index: array_index.to_vec(),
+                    identifier: port.token.replace(&port_name),
+                    r#type: ExpandedModportPortType::Resolved(member.declaration.clone()),
+                    interface_target: port.token.replace(&interface_target),
+                    direction: member.direction,
+                    direction_token: port.token.replace(direction_text),
+                }
+            })
+            .collect();
+        Self { ports }
+    }
+}
+
+enum ResolvedExpandedPort {
+    DirectLegacy,
+    Nested {
+        interface: ResolvedExpandedPortInterface,
+        members: std::sync::Arc<ResolvedExpandedMemberSet>,
+    },
+}
+
+fn resolved_expanded_port(
+    frame: Option<EmissionFrame<'_>>,
+    token: &Token,
+) -> Result<ResolvedExpandedPort, veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
+    let Some(frame) = frame else {
+        return Ok(ResolvedExpandedPort::DirectLegacy);
+    };
+    let Some(ExpandedPortResolution::Nested {
+        interface, members, ..
+    }) = frame.expanded_port_for_emission(token.id)?
+    else {
+        return Ok(ResolvedExpandedPort::DirectLegacy);
+    };
+    Ok(ResolvedExpandedPort::Nested {
+        interface: interface.clone(),
+        members: std::sync::Arc::clone(members),
+    })
 }
 
 #[derive(Clone, Debug)]
 pub struct ExpandedModportPortTableEntry {
-    id: StrId,
+    pub(super) id: StrId,
     pub identifier: VerylToken,
     pub interface_name: VerylToken,
     pub array_size: Vec<isize>,
     pub generic_maps: Vec<GenericMap>,
     pub ports: Vec<ExpandedModportPorts>,
+    pub(super) resolved_members: Option<std::sync::Arc<ResolvedExpandedMemberSet>>,
 }
 
 pub struct ExpandedModportPortTable {
     entries: Vec<ExpandedModportPortTableEntry>,
+    index: ExpandedModportLookupIndex,
 }
 
 impl ExpandedModportPortTable {
     fn new() -> Self {
         Self {
             entries: Vec::new(),
+            index: ExpandedModportLookupIndex::default(),
         }
     }
 
@@ -335,7 +516,8 @@ impl ExpandedModportPortTable {
         namespace: &Namespace,
         in_function: bool,
         context: &SymbolContext,
-    ) -> Self {
+        frame: Option<EmissionFrame<'_>>,
+    ) -> Result<Self, veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
         let mut ret = ExpandedModportPortTable::new();
         ret.expand(
             defined_ports,
@@ -344,8 +526,10 @@ impl ExpandedModportPortTable {
             namespace,
             in_function,
             context,
-        );
-        ret
+            frame,
+        )?;
+        ret.index = ExpandedModportLookupIndex::build(&ret.entries);
+        Ok(ret)
     }
 
     fn expand(
@@ -356,41 +540,116 @@ impl ExpandedModportPortTable {
         namespace: &Namespace,
         in_function: bool,
         context: &SymbolContext,
-    ) {
+        frame: Option<EmissionFrame<'_>>,
+    ) -> Result<(), veryl_analyzer::nested_modport::NestedModportAnalysisInvariant> {
         for (modport, port, _) in collect_modports(defined_ports, namespace) {
             if !(in_function || attribute_table::is_expand(&port.token.token, ExpandItem::Modport))
             {
                 continue;
             }
 
-            let Some((interface_symbol, interface_path, interface_tables)) =
-                resolve_interface(&port, namespace, generic_map)
-            else {
-                unreachable!()
-            };
-
             let property = port.property();
             let array_size = evaluate_array_size(&property.r#type.array, generic_map);
             let array_index = expand_array_index(&array_size, &[]);
-            let interface_name = {
-                let text = symbol_string(
-                    namespace_token,
-                    &interface_symbol,
-                    &interface_symbol.namespace,
-                    &interface_path,
-                    &interface_tables,
-                    context,
-                    1,
-                );
-                port.token.replace(&text)
-            };
-
+            let resolved = resolved_expanded_port(frame, &port.token.token)?;
+            let (interface_name, entry_generic_maps, resolved_members) =
+                if let ResolvedExpandedPort::Nested { interface, members } = resolved {
+                    let Some(interface_symbol) = symbol_table::get(interface.symbol) else {
+                        return Err(veryl_analyzer::nested_modport::NestedModportAnalysisInvariant::MissingExpandedPort);
+                    };
+                    let base_name = symbol_string(
+                        namespace_token,
+                        &interface_symbol,
+                        &interface_symbol.namespace,
+                        &[],
+                        &GenericTables::default(),
+                        context,
+                        1,
+                    );
+                    let text = if interface.generic_map.id.is_some() {
+                        let raw_base_token = interface_symbol.token.to_string();
+                        let base_token =
+                            raw_base_token.strip_prefix("r#").unwrap_or(&raw_base_token);
+                        let Some(namespace_prefix) = base_name.strip_suffix(&base_token) else {
+                            return Err(veryl_analyzer::nested_modport::NestedModportAnalysisInvariant::MissingExpandedPort);
+                        };
+                        format!(
+                            "{namespace_prefix}{}",
+                            interface
+                                .generic_map
+                                .name(false, context.build_opt.hashed_mangled_name)
+                        )
+                    } else {
+                        base_name
+                    };
+                    (
+                        port.token.replace(&text),
+                        vec![interface.generic_map],
+                        Some(members),
+                    )
+                } else {
+                    let connected_generic_map = frame
+                        .and_then(|frame| frame.connected_generic_map(port.name()))
+                        .map(std::slice::from_ref);
+                    let interface_generic_maps = connected_generic_map.unwrap_or(generic_map);
+                    let resolved_interface = (!direct_interface_resolution_failure_forced())
+                        .then(|| resolve_interface(&port, namespace, interface_generic_maps))
+                        .flatten();
+                    let Some((interface_symbol, interface_path, interface_tables)) =
+                        resolved_interface
+                    else {
+                        return Err(veryl_analyzer::nested_modport::NestedModportAnalysisInvariant::MissingExpandedPort);
+                    };
+                    let text = connected_generic_map
+                        .and_then(|maps| maps.first())
+                        .and_then(|map| map.id)
+                        .and_then(symbol_table::get)
+                        .map(|connected_interface| {
+                            symbol_string(
+                                namespace_token,
+                                &connected_interface,
+                                &connected_interface.namespace,
+                                &[],
+                                &GenericTables::default(),
+                                context,
+                                1,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            symbol_string(
+                                namespace_token,
+                                &interface_symbol,
+                                &interface_symbol.namespace,
+                                &interface_path,
+                                &interface_tables,
+                                context,
+                                1,
+                            )
+                        });
+                    (
+                        port.token.replace(&text),
+                        connected_generic_map
+                            .map(<[GenericMap]>::to_vec)
+                            .unwrap_or_else(|| interface_symbol.generic_maps()),
+                        None,
+                    )
+                };
             let ports = if array_index.is_empty() {
-                vec![ExpandedModportPorts::new(&port, &modport, &[])]
+                vec![if let Some(members) = resolved_members.as_deref() {
+                    ExpandedModportPorts::new_resolved(&port, members.members(), &[])
+                } else {
+                    ExpandedModportPorts::new(&port, &modport, &[])
+                }]
             } else {
                 array_index
                     .iter()
-                    .map(|index| ExpandedModportPorts::new(&port, &modport, index))
+                    .map(|index| {
+                        if let Some(members) = resolved_members.as_deref() {
+                            ExpandedModportPorts::new_resolved(&port, members.members(), index)
+                        } else {
+                            ExpandedModportPorts::new(&port, &modport, index)
+                        }
+                    })
                     .collect()
             };
 
@@ -398,16 +657,21 @@ impl ExpandedModportPortTable {
                 id: port.name(),
                 identifier: port.token.clone(),
                 interface_name,
-                generic_maps: interface_symbol.generic_maps(),
+                generic_maps: entry_generic_maps,
                 array_size,
                 ports,
+                resolved_members,
             };
             self.entries.push(entry);
         }
+        Ok(())
     }
 
     pub fn get(&self, token: &Token) -> Option<ExpandedModportPortTableEntry> {
-        self.entries.iter().find(|x| x.id == token.text).cloned()
+        self.index
+            .entry(token.text)
+            .and_then(|index| self.entries.get(index))
+            .cloned()
     }
 
     pub fn get_modport_member(
@@ -416,16 +680,22 @@ impl ExpandedModportPortTable {
         member_token: &Token,
         array_index: &[isize],
     ) -> Option<ExpandedModportPort> {
-        let entry = self.entries.iter().find(|x| x.id == modport_token.text)?;
-        entry
-            .ports
-            .iter()
-            .flat_map(|x| x.ports.iter())
-            .find(|x| x.id == member_token.text && x.array_index == array_index)
+        self.get_modport_member_path(modport_token, &[member_token.text], array_index)
+    }
+
+    pub fn get_modport_member_path(
+        &self,
+        modport_token: &Token,
+        member_path: &[StrId],
+        array_index: &[isize],
+    ) -> Option<ExpandedModportPort> {
+        self.index
+            .member(&self.entries, modport_token.text, member_path, array_index)
             .cloned()
     }
 
     pub fn drain(&mut self) -> Vec<ExpandedModportPortTableEntry> {
+        self.index = ExpandedModportLookupIndex::default();
         self.entries.drain(..).collect()
     }
 

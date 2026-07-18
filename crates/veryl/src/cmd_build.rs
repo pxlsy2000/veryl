@@ -61,7 +61,11 @@ impl CmdBuild {
             incremental,
             check_error,
             filelist_excluded,
+            nested_modport_analysis,
         } = pipeline::analyze(metadata, &paths, options, ir, test_filter)?;
+        let nested_modport_analysis = nested_modport_analysis.ok_or_else(|| {
+            miette::miette!("emission requires finalized nested modport analysis")
+        })?;
 
         let mut stopwatch = StopWatch::new();
 
@@ -89,7 +93,13 @@ impl CmdBuild {
                 };
 
                 let mut emitter = Emitter::new(metadata, &path.src, &dst, &map);
-                emitter.emit(&context.parser.veryl, &context.input);
+                emitter
+                    .emit(
+                        &context.parser.veryl,
+                        &context.input,
+                        nested_modport_analysis.as_ref(),
+                    )
+                    .into_diagnostic()?;
 
                 let dst_dir = dst.parent().unwrap();
                 if !dst_dir.exists() {
@@ -568,6 +578,123 @@ incremental = true
             name,
             &[("a.veryl", INC_FILE_A), ("b.veryl", INC_FILE_B)],
         )
+    }
+
+    #[test]
+    fn nested_finalizer_failure_is_atomic_across_pipeline_modes() {
+        use veryl_analyzer::AnalyzerError;
+        use veryl_analyzer::nested_modport::NestedModportAnalysisInvariant;
+
+        let _lock = BUILD_TEST_LOCK.lock().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut metadata, _project_path) = write_incremental_project(
+            tempdir.path(),
+            "nested_finalizer_failure",
+            &[("clean.veryl", CLEAN_MODULE)],
+        );
+        let paths = metadata
+            .paths(&Vec::<PathBuf>::new(), true, true)
+            .expect("paths");
+
+        Analyzer::new(&metadata).clear();
+        let emit_result = pipeline::analyze_with_nested_finalizer_conflict(
+            &metadata,
+            &paths,
+            AnalyzeOptions {
+                defines: &[],
+                emit_mode: true,
+                incremental: false,
+                fail_fast: false,
+            },
+            None,
+            None,
+        );
+        assert!(emit_result.is_err());
+
+        Analyzer::new(&metadata).clear();
+        let fail_fast_result = pipeline::analyze_with_nested_finalizer_conflict(
+            &metadata,
+            &paths,
+            AnalyzeOptions {
+                defines: &[],
+                emit_mode: false,
+                incremental: false,
+                fail_fast: true,
+            },
+            None,
+            None,
+        );
+        assert!(fail_fast_result.is_err());
+
+        Analyzer::new(&metadata).clear();
+        let output = pipeline::analyze_with_nested_finalizer_conflict(
+            &metadata,
+            &paths,
+            AnalyzeOptions {
+                defines: &[],
+                emit_mode: false,
+                incremental: false,
+                fail_fast: false,
+            },
+            None,
+            None,
+        )
+        .expect("non-emitting best-effort analysis preserves diagnostics");
+        assert!(output.nested_modport_analysis.is_none());
+        assert!(output.check_error.related.iter().any(|diagnostic| {
+            matches!(
+                diagnostic,
+                pipeline::Diag::Analyzer(AnalyzerError::NestedModportAnalysisInvariant {
+                    kind: NestedModportAnalysisInvariant::AlreadyFinalized,
+                    ..
+                })
+            )
+        }));
+        Analyzer::new(&metadata).clear();
+    }
+
+    #[test]
+    fn nested_finalizer_fault_is_not_consumed_by_an_unrelated_analysis_call() {
+        let _lock = BUILD_TEST_LOCK.lock().unwrap();
+        let tempdir = tempfile::tempdir().unwrap();
+        let (mut metadata, _project_path) = write_incremental_project(
+            tempdir.path(),
+            "nested_finalizer_fault_isolation",
+            &[("clean.veryl", CLEAN_MODULE)],
+        );
+        let paths = metadata
+            .paths(&Vec::<PathBuf>::new(), true, true)
+            .expect("paths");
+
+        Analyzer::new(&metadata).clear();
+        let unrelated = pipeline::analyze(
+            &metadata,
+            &paths,
+            AnalyzeOptions {
+                defines: &[],
+                emit_mode: false,
+                incremental: false,
+                fail_fast: true,
+            },
+            None,
+            None,
+        );
+        assert!(unrelated.is_ok(), "fault leaked into an unrelated call");
+
+        let isolated_fault = pipeline::analyze_with_nested_finalizer_conflict(
+            &metadata,
+            &paths,
+            AnalyzeOptions {
+                defines: &[],
+                emit_mode: false,
+                incremental: false,
+                fail_fast: true,
+            },
+            None,
+            None,
+        );
+        assert!(isolated_fault.is_err());
+        Analyzer::new(&metadata).clear();
     }
 
     const CLEAN_MODULE: &str = r#"

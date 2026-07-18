@@ -767,8 +767,13 @@ impl ReferenceTable {
                 ReferenceCandidate::ModportItem { arg } => {
                     let mut path: SymbolPathNamespace =
                         arg.modport_item_path.identifier.as_ref().into();
-                    path.pop_namespace();
-                    self.check_simple_identifier(&path, &arg.into(), None);
+                    let is_nested_forwarding = Direction::from(arg.direction.as_ref())
+                        == Direction::Modport
+                        && !arg.modport_item_path.modport_item_path_list.is_empty();
+                    if !is_nested_forwarding {
+                        path.pop_namespace();
+                        self.check_simple_identifier(&path, &arg.into(), None);
+                    }
                 }
                 ReferenceCandidate::InstParameterItem { arg } => {
                     if arg.inst_parameter_item_opt.is_none() {

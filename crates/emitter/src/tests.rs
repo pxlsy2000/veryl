@@ -1,30 +1,48 @@
 use crate::Emitter;
 use std::path::PathBuf;
+use veryl_analyzer::nested_modport::{EmissionPhase, NestedModportAnalysisInvariant};
+use veryl_analyzer::symbol::SymbolKind;
 use veryl_analyzer::{Analyzer, Context, attribute_table, symbol_table};
 use veryl_metadata::{ClockType, Metadata, ProjectProperty, ResetType};
 use veryl_parser::Parser;
 
 #[track_caller]
 fn emit(metadata: &Metadata, code: &str) -> String {
+    emit_artifacts(metadata, code).0
+}
+
+#[track_caller]
+fn emit_artifacts(metadata: &Metadata, code: &str) -> (String, Vec<u8>) {
     symbol_table::clear();
     attribute_table::clear();
 
-    let parser = Parser::parse(code, &"").unwrap();
+    let source_path = PathBuf::from("test.veryl");
+    let parser = Parser::parse(code, &source_path).unwrap();
     let analyzer = Analyzer::new(metadata);
     let mut context = Context::default();
 
     analyzer.analyze_pass1("prj", &parser.veryl);
     Analyzer::analyze_post_pass1();
-    analyzer.analyze_pass2(&parser.veryl, &mut context, None);
+    let _ = analyzer.analyze_pass2(&parser.veryl, &mut context, None);
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("emitter analysis must finalize");
 
     let mut emitter = Emitter::new(
         metadata,
-        &PathBuf::from("test.veryl"),
+        &source_path,
         &PathBuf::from("test.sv"),
         &PathBuf::from("test.sv.map"),
     );
-    emitter.emit(&parser.veryl, code);
-    emitter.as_str().to_string()
+    emitter
+        .emit(&parser.veryl, code, analysis.as_ref())
+        .expect("emission must succeed");
+    let text = emitter.as_str().to_string();
+    let source_map = emitter
+        .source_map()
+        .to_bytes()
+        .expect("successful emission must build a source map");
+    (text, source_map)
 }
 
 #[track_caller]
@@ -48,19 +66,339 @@ fn emit_multiple(metadata: &Metadata, inputs: &[&str]) -> String {
 
     let mut context = Context::default();
     for (parser, analyzer) in &parsers {
-        analyzer.analyze_pass2(&parser.veryl, &mut context, None);
+        let _ = analyzer.analyze_pass2(&parser.veryl, &mut context, None);
     }
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("emitter analysis must finalize");
 
     // Emit the last input (the consumer module).
     let (parser, _) = parsers.last().unwrap();
     let mut emitter = Emitter::new(
         metadata,
-        &PathBuf::from("test.veryl"),
+        &PathBuf::from(format!("test_{}.veryl", inputs.len() - 1)),
         &PathBuf::from("test.sv"),
         &PathBuf::from("test.sv.map"),
     );
-    emitter.emit(&parser.veryl, inputs.last().unwrap());
+    emitter
+        .emit(&parser.veryl, inputs.last().unwrap(), analysis.as_ref())
+        .expect("emission must succeed");
     emitter.as_str().to_string()
+}
+
+#[test]
+fn nested_references_rewrite_rhs_and_all_lhs_forms() {
+    let code = r#"interface ChildIf {
+    var payload: logic<8>;
+    modport sink {
+        payload: inout,
+    }
+}
+
+interface ParentIf {
+    inst child: ChildIf;
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+module Consumer (
+    p: modport ParentIf::sink,
+) {
+    var observed: logic;
+    always_comb {
+        p.child.payload[0] = p.child.payload[1];
+        observed = p.child.payload[2];
+    }
+    assign p.child.payload[3] = p.child.payload[4];
+    assign {p.child.payload[5], p.child.payload[6]} = '0;
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert!(!emitted.contains("p.child.payload"));
+    assert!(emitted.matches("p.child__payload").count() >= 7);
+}
+
+#[test]
+fn nested_terminal_affixes_are_preserved_by_every_emission_consumer() {
+    let code = r#"interface ChildIf {
+    var clk: clock;
+    var rst: reset;
+    modport source {
+        clk: output,
+        rst: output,
+    }
+}
+
+interface ParentIf {
+    inst child: ChildIf;
+    always_comb {
+        child.clk = child.clk;
+        child.rst = child.rst;
+    }
+    modport source {
+        child.source: modport,
+    }
+}
+
+#[expand(modport)]
+module Source (
+    p: modport ParentIf::source,
+) {
+    always_comb {
+        p.child.clk = p.child.clk;
+        p.child.rst = p.child.rst;
+    }
+}
+
+module Top {
+    inst p: ParentIf;
+    inst source: Source (p: p);
+}
+"#;
+    let mut metadata = Metadata::create_default("prj").unwrap();
+    metadata.build.clock_posedge_prefix = Some("cp_".to_string());
+    metadata.build.clock_posedge_suffix = Some("_cs".to_string());
+    metadata.build.reset_low_prefix = Some("rp_".to_string());
+    metadata.build.reset_low_suffix = Some("_rs".to_string());
+
+    let (emitted, source_map) = emit_artifacts(&metadata, code);
+    let expected_identifiers = [
+        "cp_child__clk_cs",
+        "rp_child__rst_rs",
+        "__p_cp_child__clk_cs",
+        "__p_rp_child__rst_rs",
+        "p.cp_child__clk_cs",
+        "p.rp_child__rst_rs",
+    ];
+    for identifier in expected_identifiers {
+        assert!(
+            emitted.contains(identifier),
+            "missing {identifier}: {emitted}"
+        );
+    }
+    assert!(!emitted.contains("child__clk;"), "{emitted}");
+    assert!(!emitted.contains("child__rst;"), "{emitted}");
+    let source_map = String::from_utf8(source_map).expect("source map must be UTF-8 JSON");
+    assert!(source_map.contains("\"sources\":[\"test.veryl\"]"));
+    assert!(source_map.contains("\"mappings\":\""));
+}
+
+#[test]
+fn nested_raw_identifier_rewrite_preserves_emission_and_source_map() {
+    let code = r##"interface ChildIf {
+    var payload: logic;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf {
+    inst r#same: ChildIf;
+    modport sink {
+        r#same.sink: modport,
+    }
+}
+
+module Consumer (
+    p: modport ParentIf::sink,
+) {
+    let observed: logic = p.r#same.payload;
+}
+"##;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let (emitted, source_map) = emit_artifacts(&metadata, code);
+    let source_map = String::from_utf8(source_map).expect("source map must be UTF-8 JSON");
+
+    assert!(emitted.contains("same__payload"));
+    assert!(!emitted.contains("r#same"));
+    assert!(source_map.contains("\"sources\":[\"test.veryl\"]"));
+    assert!(source_map.contains("\"mappings\":\""));
+}
+
+#[test]
+fn emission_fault_in_either_phase_commits_no_text_or_mappings() {
+    let code = "module ModuleA {}";
+    let metadata = Metadata::create_default("prj").unwrap();
+    let source_path = PathBuf::from("fault.veryl");
+    let parser = Parser::parse(code, &source_path).unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let _ = analyzer.analyze_pass1("prj", &parser.veryl);
+    let _ = Analyzer::analyze_post_pass1();
+    let _ = analyzer.analyze_pass2(&parser.veryl, &mut context, None);
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("fault fixture analysis must finalize");
+
+    let faults = [
+        (
+            EmissionPhase::Align,
+            NestedModportAnalysisInvariant::MissingLowering,
+        ),
+        (
+            EmissionPhase::Build,
+            NestedModportAnalysisInvariant::MissingRewrite,
+        ),
+        (
+            EmissionPhase::Build,
+            NestedModportAnalysisInvariant::MissingExpandedPort,
+        ),
+        (
+            EmissionPhase::Align,
+            NestedModportAnalysisInvariant::UnconsumedBindings,
+        ),
+        (
+            EmissionPhase::Build,
+            NestedModportAnalysisInvariant::UnconsumedBindings,
+        ),
+    ];
+    for (phase, invariant) in faults {
+        let mut emitter = Emitter::new(
+            &metadata,
+            &source_path,
+            &PathBuf::from("fault.sv"),
+            &PathBuf::from("fault.sv.map"),
+        );
+        emitter.inject_emission_fault(phase, invariant.clone());
+
+        let error = emitter
+            .emit(&parser.veryl, code, analysis.as_ref())
+            .expect_err("injected phase must fail");
+        let source_map = emitter.source_map().to_bytes();
+
+        match invariant {
+            NestedModportAnalysisInvariant::MissingLowering => assert!(matches!(
+                error,
+                crate::EmitterError::MissingNestedModportLowering { .. }
+            )),
+            NestedModportAnalysisInvariant::MissingRewrite => assert!(matches!(
+                error,
+                crate::EmitterError::MissingPathRewrite { .. }
+            )),
+            NestedModportAnalysisInvariant::MissingExpandedPort => assert!(matches!(
+                error,
+                crate::EmitterError::MissingExpandedPortResolution { .. }
+            )),
+            _ => assert!(matches!(
+                error,
+                crate::EmitterError::ConflictingEmissionBinding { .. }
+            )),
+        }
+        assert!(emitter.as_str().is_empty());
+        assert!(source_map.is_err());
+    }
+}
+
+#[test]
+fn function_frame_fault_matrix_is_typed_and_commits_neither_phase() {
+    symbol_table::clear();
+    attribute_table::clear();
+    let code = r#"interface ChildIf {
+    var payload: logic;
+    modport sink { payload: input, }
+}
+interface ParentIf {
+    inst child: ChildIf;
+    modport sink { child.sink: modport, }
+}
+package Pkg {
+    function sample (
+        p: modport ParentIf::sink,
+    ) -> logic {
+        return p.child.payload;
+    }
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+    let source_path = PathBuf::from("function_frame_fault.veryl");
+    let parser = Parser::parse(code, &source_path).unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    assert!(analyzer.analyze_pass1("prj", &parser.veryl).is_empty());
+    assert!(Analyzer::analyze_post_pass1().is_empty());
+    assert!(
+        analyzer
+            .analyze_pass2(&parser.veryl, &mut context, None)
+            .is_empty()
+    );
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("function fault fixture analysis must finalize");
+    let expected_source = veryl_parser::resource_table::get_path_id(&source_path)
+        .expect("fixture source path must be interned");
+    let function = symbol_table::get_all()
+        .into_iter()
+        .find(|symbol| {
+            symbol.token.text.to_string() == "sample"
+                && symbol.token.source.get_path() == Some(expected_source)
+                && matches!(symbol.kind, SymbolKind::Function(_))
+        })
+        .expect("sample function symbol must exist");
+    let source = function
+        .token
+        .source
+        .get_path()
+        .expect("sample function must have a source path");
+    let declaration = function.token.id;
+    let faults = [
+        (
+            "owner mismatch",
+            NestedModportAnalysisInvariant::CrossOwnerRecord,
+        ),
+        (
+            "package scope mismatch",
+            NestedModportAnalysisInvariant::PackageScopeMismatch,
+        ),
+        (
+            "swapped specialization",
+            NestedModportAnalysisInvariant::MismatchedEmissionContext,
+        ),
+        (
+            "extra or duplicate frame",
+            NestedModportAnalysisInvariant::DuplicateBindingId,
+        ),
+        (
+            "skipped or unconsumed frame",
+            NestedModportAnalysisInvariant::UnconsumedBindings,
+        ),
+    ];
+
+    for phase in [EmissionPhase::Align, EmissionPhase::Build] {
+        for (case, invariant) in &faults {
+            let mut emitter = Emitter::new(
+                &metadata,
+                &source_path,
+                &PathBuf::from("function_frame_fault.sv"),
+                &PathBuf::from("function_frame_fault.sv.map"),
+            );
+            emitter.inject_function_frame_fault(phase, invariant.clone());
+
+            let error = emitter
+                .emit(&parser.veryl, code, analysis.as_ref())
+                .unwrap_err();
+            let expected = crate::EmitterError::ConflictingEmissionBinding {
+                source_path: source,
+                declaration,
+                invariant: invariant.clone(),
+            };
+            assert_eq!(error, expected, "{case} in {phase:?}");
+            assert_eq!(
+                error.to_string(),
+                format!("conflicting emission binding at {source:?}/{declaration:?}: {invariant}"),
+                "{case} in {phase:?}"
+            );
+            assert!(emitter.as_str().is_empty(), "{case} in {phase:?}");
+            assert!(
+                emitter.source_map().to_bytes().is_err(),
+                "{case} in {phase:?} must not commit a source map"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1207,6 +1545,7 @@ fn inst_module_givne_via_package() {
     let code = r#"proto module ProtoModuleA;
 module ModuleA for ProtoModuleA {
 }
+
 proto package ProtoPkgA {
     alias module InstModule: ProtoModuleA;
 }
@@ -1351,13 +1690,13 @@ module Cpu (
     let ret = emit(&metadata, code);
     println!("{ret}");
 
-    assert!(ret.contains("logic cpu__fatal;"));
-    assert!(ret.contains("logic cpu__mask ;"));
+    assert!(ret.contains("cpu__fatal;"));
+    assert!(ret.contains("cpu__mask ;"));
     assert!(ret.contains("input cpu__fatal"));
     assert!(ret.contains("input cpu__mask"));
     assert!(ret.contains("output cpu__fatal"));
     assert!(ret.contains("output cpu__mask"));
-    assert!(ret.contains("seen = cpu__fatal;"));
+    assert!(ret.contains("= cpu__fatal;"));
     assert!(!ret.contains("seen = cpu.fatal;"));
     assert!(ret.contains("fatal_seen = irq.cpu__fatal;"));
 
@@ -1367,6 +1706,443 @@ module Cpu (
         .and_then(|x| x.split("endinterface").next())
         .expect("emitted IrqIf interface");
     assert!(!irq_if.contains("prj_CpuIf cpu"));
+}
+
+#[test]
+fn nested_generic_specializations_and_ordinary_instances_use_resolved_terminals() {
+    let code = r#"interface ChildIf::<W: u32> {
+    var payload: logic<W>;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf::<W: u32> {
+    inst child: ChildIf::<W>;
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+module Consumer {
+    inst parent8 : ParentIf::<8>;
+    inst parent16: ParentIf::<16>;
+    let byte: logic<8> = parent8.child.payload;
+    let word: logic<16> = parent16.child.payload;
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert!(emitted.contains("logic[8-1:0] child__payload"), "{emitted}");
+    assert!(
+        emitted.contains("logic[16-1:0] child__payload"),
+        "{emitted}"
+    );
+    assert!(emitted.contains("= parent8.child__payload"));
+    assert!(emitted.contains("= parent16.child__payload"));
+    assert!(!emitted.contains(".child.payload"));
+}
+
+fn nested_declaration_emission_work(scale: usize, scan_mutation: bool) -> (usize, String) {
+    let mut code = String::from(
+        "interface LeafIf {\n    var payload: logic;\n    modport sink { payload: input, }\n}\n\ninterface ParentIf {\n",
+    );
+    for index in 0..scale {
+        code.push_str(&format!("    inst child{index}: LeafIf;\n"));
+    }
+    code.push_str("    modport sink {\n");
+    for index in 0..scale {
+        code.push_str(&format!("        child{index}.sink: modport,\n"));
+    }
+    code.push_str("    }\n}\n");
+    let metadata = Metadata::create_default("prj").unwrap();
+    let mutation = scan_mutation.then(super::emitter::inject_nested_declaration_scan_mutation);
+    super::emitter::reset_nested_declaration_terminal_probes();
+    let emitted = emit(&metadata, &code);
+    drop(mutation);
+    let probes = super::emitter::nested_declaration_terminal_probes();
+    for index in 0..scale {
+        assert!(
+            emitted.contains(&format!("child{index}__payload")),
+            "{emitted}"
+        );
+    }
+    (probes, emitted)
+}
+
+#[test]
+fn nested_declaration_emission_uses_affine_root_buckets() {
+    let indexed = [8, 16, 32].map(|scale| nested_declaration_emission_work(scale, false));
+    let scanned = [8, 16, 32].map(|scale| nested_declaration_emission_work(scale, true));
+    for (indexed, scanned) in indexed.iter().zip(&scanned) {
+        assert_eq!(indexed.1, scanned.1);
+    }
+    let work = indexed.map(|(work, _)| work);
+    let scanned_work = scanned.map(|(work, _)| work);
+    println!("declaration indexed={work:?} mutation={scanned_work:?}");
+    assert!(work[0] > 0, "{work:?}");
+    assert!(work[1] <= 3 * work[0], "{work:?}");
+    assert!(work[2] <= 3 * work[1], "{work:?}");
+    assert!(scanned_work[1] > 3 * scanned_work[0], "{scanned_work:?}");
+    assert!(scanned_work[2] > 3 * scanned_work[1], "{scanned_work:?}");
+}
+
+#[test]
+fn nested_forwarding_does_not_capture_unrelated_child_instances() {
+    let code = r#"interface ChildIf {
+    var payload: logic;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf {
+    inst forwarded: ChildIf;
+    inst unrelated: ChildIf;
+    let observed: logic = unrelated.payload;
+    modport sink {
+        forwarded.sink: modport,
+    }
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+    let parent = emitted
+        .split("interface prj_ParentIf;")
+        .nth(1)
+        .and_then(|text| text.split("endinterface").next())
+        .expect("emitted ParentIf interface");
+
+    assert!(parent.contains("forwarded__payload"));
+    assert!(parent.contains("prj_ChildIf unrelated"));
+    assert!(parent.contains("= unrelated.payload"));
+    assert!(!parent.contains("unrelated__payload"));
+}
+
+#[test]
+fn nested_same_and_converse_emit_fully_expanded_member_sets() {
+    let code = r#"interface ChildIf {
+    var request: logic;
+    var response: logic;
+    modport initiator {
+        request : output,
+        response: input ,
+    }
+}
+
+interface ParentIf {
+    inst child: ChildIf;
+    modport forwarded {
+        child.initiator: modport,
+    }
+    modport same_view {
+        ..same(forwarded)
+    }
+    modport converse_view {
+        ..converse(forwarded)
+    }
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+    let parent = emitted
+        .split("interface prj_ParentIf;")
+        .nth(1)
+        .and_then(|text| text.split("endinterface").next())
+        .expect("emitted ParentIf interface");
+    let same = parent
+        .split("modport same_view (")
+        .nth(1)
+        .and_then(|text| text.split(");").next())
+        .expect("same modport");
+    let converse = parent
+        .split("modport converse_view (")
+        .nth(1)
+        .and_then(|text| text.split(");").next())
+        .expect("converse modport");
+
+    assert!(same.contains("output child__request"));
+    assert!(same.contains("input  child__response"));
+    assert!(converse.contains("input  child__request"));
+    assert!(converse.contains("output child__response"));
+}
+
+#[test]
+fn nested_expanded_modport_uses_resolved_members_for_named_and_positional_connections() {
+    let code = r#"interface ChildIf {
+    var payload: logic<8>;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf {
+    inst child: ChildIf;
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+#[expand(modport)]
+module Sink (
+    p: modport ParentIf::sink,
+) {
+    let observed: logic<8> = p.child.payload;
+}
+
+module Top {
+    inst p: ParentIf;
+    inst named: Sink (p: p);
+    inst positional: Sink (p);
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert!(
+        emitted.contains("input logic[8-1:0] __p_child__payload"),
+        "{emitted}"
+    );
+    assert_eq!(emitted.matches("module prj_Sink (").count(), 1, "{emitted}");
+    assert_eq!(
+        emitted.matches("(p.child__payload)").count(),
+        2,
+        "{emitted}"
+    );
+    assert!(!emitted.contains("p.child.payload"));
+}
+
+#[test]
+fn non_generic_owner_names_distinguish_connected_nested_specializations() {
+    let code = r#"interface ChildIf::<W: u32 = 8> {
+    var payload: logic<W>;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf::<W: u32 = 8> {
+    inst child: ChildIf::<W>;
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+#[expand(modport)]
+module Sink (
+    p: modport ParentIf::sink,
+) {
+    let observed: logic = p.child.payload[0];
+}
+
+module Top {
+    inst parent8 : ParentIf::<8>;
+    inst parent16: ParentIf::<16>;
+    inst sink8 : Sink (p: parent8 );
+    inst sink16: Sink (p: parent16);
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert_eq!(
+        emitted
+            .matches("module prj_Sink__p____ParentIf__8 (")
+            .count(),
+        1,
+        "{emitted}"
+    );
+    assert_eq!(
+        emitted
+            .matches("module prj_Sink__p____ParentIf__16 (")
+            .count(),
+        1,
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("prj_Sink__p____ParentIf__8 sink8"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("prj_Sink__p____ParentIf__16 sink16"),
+        "{emitted}"
+    );
+    let top = emitted.split("module prj_Top").nth(1).expect("Top module");
+    assert!(!top.contains("prj___ParentIf__8 p"), "{emitted}");
+    assert!(
+        !top.contains("p.child__payload = __p_child__payload"),
+        "{emitted}"
+    );
+}
+
+#[test]
+fn expanded_internal_interface_uses_connected_specialization_not_formal_default() {
+    fn emit_with_default(default_width: u32) -> String {
+        let code = format!(
+            r#"interface ChildIf::<W: u32 = {default_width}> {{
+    var payload: logic<W>;
+    modport sink {{
+        payload: input,
+    }}
+}}
+
+interface ParentIf::<W: u32 = {default_width}> {{
+    inst child: ChildIf::<W>;
+    modport sink {{
+        child.sink: modport,
+    }}
+}}
+
+#[expand(modport)]
+module Sink (
+    p: modport ParentIf::sink,
+) {{
+    let _observed: logic = p.child.payload[0];
+}}
+
+module Top {{
+    inst parent16: ParentIf::<16>;
+    inst named: Sink (p: parent16);
+    inst shorthand: Sink (parent16);
+}}
+"#
+        );
+        emit(&Metadata::create_default("prj").unwrap(), &code)
+    }
+
+    for default_width in [8, 12] {
+        let emitted = emit_with_default(default_width);
+        let expanded = emitted
+            .split("module prj_Sink__p____ParentIf__16 (")
+            .nth(1)
+            .and_then(|text| text.split("endmodule").next())
+            .expect("16-bit expanded Sink module");
+
+        assert!(
+            expanded.contains("prj___ParentIf__16 p ();"),
+            "connected ParentIf::<16> must reconstruct ParentIf__16 with formal default {default_width}: {expanded}"
+        );
+        assert!(
+            !expanded.contains(&format!("prj___ParentIf__{default_width} p ();")),
+            "formal default must not select the reconstructed interface: {expanded}"
+        );
+    }
+}
+
+#[test]
+fn expanded_internal_interface_ignores_unrelated_alternate_generic_maps() {
+    let code = r#"interface ChildIf::<W: u32 = 8> {
+    var payload: logic<W>;
+    modport sink { payload: input, }
+}
+
+interface ParentIf::<W: u32 = 8> {
+    inst child: ChildIf::<W>;
+    modport sink { child.sink: modport, }
+}
+
+#[expand(modport)]
+module Sink (
+    p: modport ParentIf::sink,
+) {
+    let observed: logic = p.child.payload[0];
+}
+
+module Top {
+    inst unrelated8 : ParentIf::<8>;
+    inst unrelated12: ParentIf::<12>;
+    inst connected16: ParentIf::<16>;
+    inst sink: Sink (p: connected16);
+}
+"#;
+    let emitted = emit(&Metadata::create_default("prj").unwrap(), code);
+    let expanded = emitted
+        .split("module prj_Sink__p____ParentIf__16 (")
+        .nth(1)
+        .and_then(|text| text.split("endmodule").next())
+        .expect("16-bit expanded Sink module");
+
+    assert!(expanded.contains("prj___ParentIf__16 p ();"), "{expanded}");
+    assert!(!expanded.contains("prj___ParentIf__8 p ();"), "{expanded}");
+    assert!(!expanded.contains("prj___ParentIf__12 p ();"), "{expanded}");
+}
+
+#[test]
+fn connected_specializations_remain_distinct_when_lowered_output_matches() {
+    let code = r#"interface ChildIf::<W: u32 = 8> {
+    var payload: logic;
+    modport sink {
+        payload: input,
+    }
+}
+
+interface ParentIf::<W: u32 = 8> {
+    inst child: ChildIf::<W>;
+    modport sink {
+        child.sink: modport,
+    }
+}
+
+#[expand(modport)]
+module Sink (
+    p: modport ParentIf::sink,
+) {}
+
+module Top {
+    inst parent8 : ParentIf::<8>;
+    inst parent16: ParentIf::<16>;
+    inst sink8 : Sink (p: parent8 );
+    inst sink16: Sink (p: parent16);
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert_eq!(
+        emitted
+            .matches("module prj_Sink__p____ParentIf__8 (")
+            .count(),
+        1,
+        "{emitted}"
+    );
+    assert_eq!(
+        emitted
+            .matches("module prj_Sink__p____ParentIf__16 (")
+            .count(),
+        1,
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("prj_Sink__p____ParentIf__8 sink8"),
+        "{emitted}"
+    );
+    assert!(
+        emitted.contains("prj_Sink__p____ParentIf__16 sink16"),
+        "{emitted}"
+    );
+}
+
+#[test]
+fn uninstantiated_generic_interface_has_an_analyzer_owned_empty_batch() {
+    let code = r#"interface GenericIf::<W: u32> {
+    var payload: logic<W>;
+    modport sink {
+        payload: input,
+    }
+}
+"#;
+    let metadata = Metadata::create_default("prj").unwrap();
+
+    let emitted = emit(&metadata, code);
+
+    assert_eq!(emitted, "\n//# sourceMappingURL=test.sv.map\n");
 }
 
 #[test]
@@ -1400,8 +2176,8 @@ module Cpu (
     let ret = emit(&metadata, code);
     println!("{ret}");
 
-    assert!(ret.contains("logic cpu__data [2];"));
-    assert!(ret.contains("seen = cpu__data[0];"));
+    assert!(ret.contains("cpu__data [2];"));
+    assert!(ret.contains("= cpu__data[0];"));
     assert!(ret.contains("data_seen = irq.cpu__data[0];"));
     assert!(!ret.contains("cpu.data[0]"));
     assert!(!ret.contains("irq.cpu.data[0]"));
@@ -1525,9 +2301,9 @@ module Cpu (
     let ret = emit(&metadata, code);
     println!("{ret}");
 
-    assert!(ret.contains("logic cpu__sub__fatal;"));
+    assert!(ret.contains("cpu__sub__fatal;"));
     assert!(ret.contains("input cpu__sub__fatal"));
-    assert!(ret.contains("seen = cpu__sub__fatal;"));
+    assert!(ret.contains("= cpu__sub__fatal;"));
     assert!(ret.contains("fatal_seen = irq.cpu__sub__fatal;"));
     assert!(!ret.contains("cpu.deep"));
 

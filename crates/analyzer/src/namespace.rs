@@ -14,6 +14,14 @@ pub struct DefineContext {
 }
 
 impl DefineContext {
+    pub(crate) fn positive_defines(&self) -> impl Iterator<Item = &StrId> {
+        self.pos.iter()
+    }
+
+    pub(crate) fn negative_defines(&self) -> impl Iterator<Item = &StrId> {
+        self.neg.iter()
+    }
+
     pub fn exclusive(&self, value: &DefineContext) -> bool {
         !self.pos.is_disjoint(&value.neg) || !self.neg.is_disjoint(&value.pos)
     }

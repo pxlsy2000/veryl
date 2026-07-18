@@ -17,12 +17,22 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
+use veryl_analyzer::nested_modport::NestedModportAnalysis;
 use veryl_analyzer::{Analyzer, AnalyzerError, CachedDiagnostic};
 use veryl_metadata::Metadata;
 use veryl_parser::resource_table::PathId;
 use veryl_parser::{Parser, resource_table};
 use veryl_path::PathSet;
+
+#[derive(Clone, Copy, Default)]
+enum NestedFinalizerFault {
+    #[default]
+    None,
+    #[cfg(test)]
+    Conflict,
+}
 
 /// A diagnostic in [`CheckError`]: freshly produced this build (`Analyzer`),
 /// or restored from the cache (`Cached`) and re-reported on a warm run.
@@ -200,6 +210,7 @@ pub struct AnalyzeOutput {
     pub check_error: CheckError,
     /// Files skipped from emit by the `--test` filter; the filelist omits them.
     pub filelist_excluded: HashSet<PathBuf>,
+    pub nested_modport_analysis: Option<Arc<NestedModportAnalysis>>,
 }
 
 pub struct AnalyzeOptions<'a> {
@@ -219,8 +230,44 @@ pub fn analyze(
     metadata: &Metadata,
     paths: &[PathSet],
     opts: AnalyzeOptions<'_>,
+    ir: Option<&mut veryl_analyzer::ir::Ir>,
+    test_filter: Option<&str>,
+) -> Result<AnalyzeOutput> {
+    analyze_with_finalizer_fault(
+        metadata,
+        paths,
+        opts,
+        ir,
+        test_filter,
+        NestedFinalizerFault::None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn analyze_with_nested_finalizer_conflict(
+    metadata: &Metadata,
+    paths: &[PathSet],
+    opts: AnalyzeOptions<'_>,
+    ir: Option<&mut veryl_analyzer::ir::Ir>,
+    test_filter: Option<&str>,
+) -> Result<AnalyzeOutput> {
+    analyze_with_finalizer_fault(
+        metadata,
+        paths,
+        opts,
+        ir,
+        test_filter,
+        NestedFinalizerFault::Conflict,
+    )
+}
+
+fn analyze_with_finalizer_fault(
+    metadata: &Metadata,
+    paths: &[PathSet],
+    opts: AnalyzeOptions<'_>,
     mut ir: Option<&mut veryl_analyzer::ir::Ir>,
     test_filter: Option<&str>,
+    _finalizer_fault: NestedFinalizerFault,
 ) -> Result<AnalyzeOutput> {
     let mut check_error = CheckError::new(metadata.build.error_count_limit);
     let mut contexts = Vec::new();
@@ -370,6 +417,23 @@ pub fn analyze(
     debug!("Executed analyze_pass2 ({} milliseconds)", stopwatch.lap());
     analyzer_context.finalize_conv_profiler()?;
 
+    #[cfg(test)]
+    if matches!(_finalizer_fault, NestedFinalizerFault::Conflict) {
+        let _ = analyzer_context.finish_nested_modport_analysis();
+    }
+
+    let nested_modport_analysis = match analyzer_context.finish_nested_modport_analysis() {
+        Ok(analysis) => Some(analysis),
+        Err(error) => {
+            let mut errors = vec![error];
+            check_error = check_error.append(&mut errors);
+            if opts.emit_mode || opts.fail_fast {
+                return Err(check_error.into());
+            }
+            None
+        }
+    };
+
     let mut errors = Analyzer::analyze_post_pass2(ir_for_pass2);
     check_error = check_error.append(&mut errors);
 
@@ -388,6 +452,7 @@ pub fn analyze(
         incremental,
         check_error,
         filelist_excluded,
+        nested_modport_analysis,
     })
 }
 

@@ -500,12 +500,17 @@ impl CreateSymbolTable {
                 .iter()
                 .filter(|(text, id)| {
                     if explicit_members.contains(text) {
-                        false
-                    } else if matches!(default, SymModportDefault::Same(_)) {
-                        true
-                    } else {
-                        let symbol = symbol_table::get(**id).unwrap();
-                        matches!(symbol.kind, SymbolKind::Variable(_))
+                        return false;
+                    }
+                    match default {
+                        SymModportDefault::Same(_) => true,
+                        SymModportDefault::Converse(_) => {
+                            default_member_directions.contains_key(text)
+                        }
+                        SymModportDefault::Input | SymModportDefault::Output => {
+                            let symbol = symbol_table::get(**id).unwrap();
+                            matches!(symbol.kind, SymbolKind::Variable(_))
+                        }
                     }
                 })
                 .collect();
@@ -532,7 +537,9 @@ impl CreateSymbolTable {
                 scope::insert_token(token.id, path, &namespace);
                 symbol_table::add_reference(*id, &token);
 
-                let kind = if matches!(direction, SymDirection::Import) {
+                let kind = if matches!(direction, SymDirection::Interface) {
+                    symbol_table::get(*id).unwrap().kind
+                } else if matches!(direction, SymDirection::Import) {
                     let property = ModportFunctionMemberProperty { function: *id };
                     SymbolKind::ModportFunctionMember(property)
                 } else {
@@ -573,12 +580,19 @@ impl CreateSymbolTable {
                             continue;
                         };
 
-                        if let SymbolKind::ModportVariableMember(member) = member_symbol.kind {
-                            ret.insert(member_symbol.token.text, member.direction);
-                        } else if matches!(default, SymModportDefault::Same(_))
-                            && matches!(member_symbol.kind, SymbolKind::ModportFunctionMember(_))
-                        {
-                            ret.insert(member_symbol.token.text, SymDirection::Import);
+                        match member_symbol.kind {
+                            SymbolKind::ModportVariableMember(member) => {
+                                ret.insert(member_symbol.token.text, member.direction);
+                            }
+                            SymbolKind::ModportFunctionMember(_)
+                                if matches!(default, SymModportDefault::Same(_)) =>
+                            {
+                                ret.insert(member_symbol.token.text, SymDirection::Import);
+                            }
+                            SymbolKind::Instance(_) => {
+                                ret.insert(member_symbol.token.text, SymDirection::Interface);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1284,11 +1298,13 @@ impl VerylGrammarTrait for CreateSymbolTable {
                                 && let Some(id) = self.interface_members.get(&root).copied()
                                 && let Some(symbol) = symbol_table::get(id)
                             {
-                                self.insert_symbol(
+                                if let Some(id) = self.insert_symbol(
                                     &path.identifier.identifier_token.token,
                                     symbol.kind,
                                     false,
-                                );
+                                ) {
+                                    members.push(id);
+                                }
                             }
                             continue;
                         }

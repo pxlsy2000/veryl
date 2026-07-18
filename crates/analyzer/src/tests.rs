@@ -1,8 +1,11 @@
 use crate::conv::Context;
 use crate::ir::Ir;
 use crate::{
-    Analyzer, AnalyzerError, analyzer_error::InvalidModportItemKind, attribute_table, symbol_table,
+    Analyzer, AnalyzerError,
+    analyzer_error::{InvalidModportItemKind, InvalidNestedModportKind},
+    attribute_table, symbol_table,
 };
+use miette::Diagnostic;
 use std::collections::HashMap;
 use std::thread;
 use veryl_metadata::{Lint, Metadata, ProjectProperty};
@@ -1704,13 +1707,21 @@ fn invalid_direction() {
     "#;
 
     let errors = analyze(code);
-    assert!(matches!(
-        errors[0],
-        AnalyzerError::InvalidModportItem {
-            kind: InvalidModportItemKind::Modport,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &errors[0],
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::MissingInterfaceSegment { segment },
+                error_location,
+                ..
+            } if path == "f"
+                && segment == "f"
+                && error_location.offset() == code.rfind("f: modport").unwrap()
+                && error_location.len() == 1
+        ),
+        "{errors:?}"
+    );
 }
 
 #[test]
@@ -2232,7 +2243,7 @@ fn nested_modport_forwarding_allows_unused_child_members() {
 }
 
 #[test]
-fn nested_modport_forwarding_rejects_partial_forward_local_reference() {
+fn nested_modport_pass2_defers_unforwarded_child_local_reference_to_finalizer() {
     let code = r#"
     interface CpuIf {
         var fatal: logic;
@@ -2253,15 +2264,16 @@ fn nested_modport_forwarding_rejects_partial_forward_local_reference() {
 
     let errors = analyze(code);
     assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        errors.iter().all(|error| !matches!(
+            error,
+            AnalyzerError::InvalidModportItem { .. } | AnalyzerError::InvalidNestedModport { .. }
+        )),
         "{errors:?}"
     );
 }
 
 #[test]
-fn nested_modport_forwarding_rejects_child_function_local_reference() {
+fn nested_modport_pass2_defers_child_function_local_reference_to_finalizer() {
     let code = r#"
     interface CpuIf {
         var fatal: logic;
@@ -2284,15 +2296,16 @@ fn nested_modport_forwarding_rejects_child_function_local_reference() {
 
     let errors = analyze(code);
     assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        errors.iter().all(|error| !matches!(
+            error,
+            AnalyzerError::InvalidModportItem { .. } | AnalyzerError::InvalidNestedModport { .. }
+        )),
         "{errors:?}"
     );
 }
 
 #[test]
-fn nested_modport_forwarding_rejects_child_import_dependency() {
+fn nested_modport_forwarding_allows_unrelated_child_import() {
     let code = r#"
     package PayloadPkg {
         struct Payload {
@@ -2317,18 +2330,7 @@ fn nested_modport_forwarding_rejects_child_import_dependency() {
     "#;
 
     let errors = analyze(code);
-    assert!(
-        errors.iter().any(|e| {
-            matches!(
-                e,
-                AnalyzerError::InvalidModportItem {
-                    kind: InvalidModportItemKind::Modport,
-                    ..
-                }
-            )
-        }),
-        "{errors:?}"
-    );
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 #[test]
@@ -2351,21 +2353,16 @@ fn nested_modport_forwarding_rejects_let_terminal() {
 
     let errors = analyze(code);
     assert!(
-        errors.iter().any(|e| {
-            matches!(
-                e,
-                AnalyzerError::InvalidModportItem {
-                    kind: InvalidModportItemKind::Modport,
-                    ..
-                }
-            )
-        }),
-        "{errors:?}"
-    );
-    assert!(
-        errors
-            .iter()
-            .any(|e| e.to_string().contains("plain variable")),
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::NonVariableTerminal {
+                    name,
+                    actual_kind,
+                },
+                ..
+            } if name == "child.ready" && actual_kind == "let-bounded variable"
+        )),
         "{errors:?}"
     );
 }
@@ -2389,19 +2386,20 @@ fn nested_modport_forwarding_rejects_dotted_direct_member() {
     "#;
 
     let errors = analyze(code);
-    assert!(
-        errors.iter().any(|e| {
+    let dotted_direct: Vec<_> = errors
+        .iter()
+        .filter(|error| {
             matches!(
-                e,
+                error,
                 AnalyzerError::InvalidModportItem {
                     kind: InvalidModportItemKind::Variable,
                     identifier,
                     ..
                 } if identifier == "payload.a"
             )
-        }),
-        "{errors:?}"
-    );
+        })
+        .collect();
+    assert_eq!(dotted_direct.len(), 1, "{errors:?}");
 }
 
 #[test]
@@ -2433,15 +2431,13 @@ fn nested_modport_forwarding_rejects_cross_modport_flat_name_collision() {
 
     let errors = analyze(code);
     assert!(
-        errors.iter().any(|e| {
-            matches!(
-                e,
-                AnalyzerError::InvalidModportItem {
-                    kind: InvalidModportItemKind::Modport,
-                    ..
-                }
-            )
-        }),
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::FlatNameCollision { flat, .. },
+                ..
+            } if flat == "cpu__sub__fatal"
+        )),
         "{errors:?}"
     );
 }
@@ -2505,15 +2501,13 @@ fn nested_modport_forwarding_rejects_cross_modport_different_path_collision() {
 
     let errors = analyze(code);
     assert!(
-        errors.iter().any(|e| {
-            matches!(
-                e,
-                AnalyzerError::InvalidModportItem {
-                    kind: InvalidModportItemKind::Modport,
-                    ..
-                }
-            )
-        }),
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::FlatNameCollision { flat, .. },
+                ..
+            } if flat == "cpu__sub__fatal"
+        )),
         "{errors:?}"
     );
 }
@@ -2589,9 +2583,13 @@ fn nested_modport_forwarding_rejects_flat_name_collisions() {
 
     let errors = analyze(explicit_member_collision);
     assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::FlatNameCollision { flat, .. },
+                ..
+            } if flat == "cpu__fatal"
+        )),
         "{errors:?}"
     );
 
@@ -2630,9 +2628,13 @@ fn nested_modport_forwarding_rejects_flat_name_collisions() {
 
     let errors = analyze(forwarded_path_collision);
     assert!(
-        errors
-            .iter()
-            .any(|e| matches!(e, AnalyzerError::InvalidModportItem { .. })),
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::FlatNameCollision { .. },
+                ..
+            }
+        )),
         "{errors:?}"
     );
 }
@@ -2656,7 +2658,29 @@ fn nested_modport_forwarding_rejects_unsupported() {
     "#;
 
     let errors = analyze(missing_child_modport);
-    assert!(!errors.is_empty(), "{errors:?}");
+    let AnalyzerError::InvalidNestedModport {
+        path,
+        kind,
+        error_location,
+        ..
+    } = &errors[0]
+    else {
+        panic!("expected typed missing-modport error: {errors:?}");
+    };
+    assert_eq!(path, "cpu.bad");
+    assert_eq!(
+        kind,
+        &InvalidNestedModportKind::MissingModport { name: "bad".into() }
+    );
+    assert_eq!(
+        error_location.offset(),
+        missing_child_modport.find("bad").unwrap()
+    );
+    assert_eq!(error_location.len(), 3);
+    assert_eq!(
+        errors[0].to_string(),
+        "cannot lower nested modport \"cpu.bad\": child modport \"bad\" was not found"
+    );
 
     let non_interface_intermediate = r#"
     interface CpuIf {
@@ -2668,7 +2692,25 @@ fn nested_modport_forwarding_rejects_unsupported() {
     "#;
 
     let errors = analyze(non_interface_intermediate);
-    assert!(!errors.is_empty(), "{errors:?}");
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::NonInterfaceSegment {
+                    segment,
+                    actual_kind,
+                },
+                error_location,
+                ..
+            } if path == "fatal.sink"
+                && segment == "fatal"
+                && actual_kind == "logic"
+                && error_location.offset() == non_interface_intermediate.find("fatal.sink").unwrap()
+                && error_location.len() == 5
+        )),
+        "{errors:?}"
+    );
 
     let function_terminal = r#"
     interface CpuIf {
@@ -2689,7 +2731,41 @@ fn nested_modport_forwarding_rejects_unsupported() {
     "#;
 
     let errors = analyze(function_terminal);
-    assert!(!errors.is_empty(), "{errors:?}");
+    let error = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error,
+                AnalyzerError::InvalidNestedModport {
+                    kind: InvalidNestedModportKind::UnsupportedMemberDirection { .. },
+                    ..
+                }
+            )
+        })
+        .expect("unsupported imported function must be diagnosed");
+    assert!(
+        matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::UnsupportedMemberDirection { direction },
+                error_location,
+                ..
+            } if path == "cpu.sink"
+                && direction == "import"
+                && error_location.offset() == function_terminal.find("fatal() ->").unwrap()
+                && error_location.len() == "fatal".len()
+        ),
+        "{errors:?}"
+    );
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("invalid_nested_modport")
+    );
+    assert_eq!(
+        error.to_string(),
+        "cannot lower nested modport \"cpu.sink\": member direction \"import\" cannot be flattened"
+    );
 
     let arrayed_interface_instance = r#"
     interface CpuIf {
@@ -2708,13 +2784,21 @@ fn nested_modport_forwarding_rejects_unsupported() {
     "#;
 
     let errors = analyze(arrayed_interface_instance);
-    assert!(matches!(
-        errors[0],
-        AnalyzerError::InvalidModportItem {
-            kind: InvalidModportItemKind::ArrayedInterface,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            &errors[0],
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::ArrayedInterfaceSegment { segment },
+                error_location,
+                ..
+            } if path == "cpu.sink"
+                && segment == "cpu"
+                && error_location.offset() == arrayed_interface_instance.rfind("cpu.sink").unwrap()
+                && error_location.len() == 3
+        ),
+        "{errors:?}"
+    );
 
     let cyclic_recursion = r#"
     interface InterfaceA {
@@ -2734,6 +2818,555 @@ fn nested_modport_forwarding_rejects_unsupported() {
 
     let errors = analyze(cyclic_recursion);
     assert!(!errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn nested_modport_terminal_diagnostic_falls_back_to_foreign_originating_item() {
+    let child = r#"interface CpuIf {
+    function fatal() -> logic { return 0; }
+    modport sink { fatal: import, }
+}"#;
+    let parent = r#"interface IrqIf {
+    inst cpu: CpuIf;
+    modport sink { cpu.sink: modport, }
+}"#;
+
+    let errors = analyze_multiple_inputs(&[child, parent]);
+    let nested: Vec<_> = errors
+        .iter()
+        .filter_map(|error| match error {
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::UnsupportedMemberDirection { direction },
+                error_location,
+                ..
+            } => Some((error, path, direction, error_location)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(nested.len(), 1, "{errors:?}");
+    let (error, path, direction, location) = nested[0];
+    assert_eq!(path, "cpu.sink");
+    assert_eq!(direction, "import");
+    assert_eq!(location.offset(), parent.find("cpu.sink").unwrap());
+    assert_eq!(location.len(), "cpu.sink".len());
+    assert_eq!(
+        error.code().map(|code| code.to_string()).as_deref(),
+        Some("invalid_nested_modport")
+    );
+    assert_eq!(
+        error.to_string(),
+        "cannot lower nested modport \"cpu.sink\": member direction \"import\" cannot be flattened"
+    );
+}
+
+#[test]
+fn nested_modport_default_views_expose_forwarded_interface_members() {
+    let code = r#"
+    interface ChildIf {
+        var request: logic;
+        modport initiator {
+            request: output,
+        }
+    }
+
+    interface ParentIf {
+        inst child: ChildIf;
+        modport forwarded {
+            child.initiator: modport,
+        }
+        modport same_view {
+            ..same(forwarded)
+        }
+        modport converse_view {
+            ..converse(forwarded)
+        }
+    }
+
+    module SameConsumer (
+        p: modport ParentIf::same_view,
+    ) {
+        assign p.child.request = 1'b0;
+    }
+
+    module ConverseConsumer (
+        p: modport ParentIf::converse_view,
+    ) {
+        let _seen: logic = p.child.request;
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert!(
+        errors.is_empty(),
+        "nested members inherited through same/converse must be legal: {errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_missing_root_has_one_typed_diagnostic() {
+    // Given: a forwarding item whose root interface instance is absent.
+    let code = r#"
+    interface ParentIf {
+        modport sink {
+            absent.sink: modport,
+        }
+    }
+    "#;
+
+    // When: every analyzer pass runs, as in the non-fail-fast pipeline.
+    let errors = analyze(code);
+
+    // Then: pass2 exclusively owns the diagnostic; pass1 adds no generic duplicate.
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        matches!(
+            &errors[0],
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::MissingInterfaceSegment { segment },
+                error_location,
+                ..
+            } if path == "absent.sink"
+                && segment == "absent"
+                && error_location.offset() == code.find("absent.sink").unwrap()
+                && error_location.len() == "absent".len()
+        ),
+        "{errors:?}"
+    );
+    assert_eq!(
+        errors[0].to_string(),
+        "cannot lower nested modport \"absent.sink\": interface segment \"absent\" was not found"
+    );
+}
+
+#[test]
+fn direct_modport_missing_members_keep_undefined_diagnostics() {
+    // Given: ordinary direct input/output items with missing variables.
+    let code = r#"
+    interface ParentIf {
+        modport sink {
+            missing_input: input,
+            missing_output: output,
+        }
+    }
+    "#;
+
+    // When: the complete analyzer runs.
+    let errors = analyze(code);
+
+    // Then: global reference checking still reports both ordinary missing names.
+    let undefined: Vec<_> = errors
+        .iter()
+        .filter_map(|error| match error {
+            AnalyzerError::UndefinedIdentifier { identifier, .. } => Some(identifier.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(undefined, ["missing_input", "missing_output"], "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|error| !matches!(error, AnalyzerError::InvalidNestedModport { .. })),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn ordinary_modport_item_errors_remain_visible_beside_nested_forwarding() {
+    // Given: ordinary unresolved/wrong-kind items and a nested forwarding error.
+    let code = r#"
+    interface ParentIf {
+        function helper() -> logic { return 0; }
+        modport sink {
+            missing_input: input,
+            helper: output,
+            absent.sink: modport,
+        }
+    }
+    "#;
+
+    // When: the complete analyzer runs.
+    let errors = analyze(code);
+
+    // Then: only the forwarding occurrence gets typed precedence; ordinary
+    // reference and kind diagnostics are still reported.
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::UndefinedIdentifier { identifier, .. }
+                if identifier == "missing_input"
+        )),
+        "{errors:?}"
+    );
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidModportItem {
+                kind: InvalidModportItemKind::Variable,
+                identifier,
+                ..
+            } if identifier == "helper"
+        )),
+        "{errors:?}"
+    );
+    let nested: Vec<_> = errors
+        .iter()
+        .filter(|error| matches!(error, AnalyzerError::InvalidNestedModport { .. }))
+        .collect();
+    assert_eq!(nested.len(), 1, "{errors:?}");
+    assert!(matches!(
+        nested[0],
+        AnalyzerError::InvalidNestedModport {
+            kind: InvalidNestedModportKind::MissingInterfaceSegment { segment },
+            ..
+        } if segment == "absent"
+    ));
+}
+
+#[test]
+fn nested_modport_non_interface_root_has_one_typed_diagnostic() {
+    // Given: a forwarding root that resolves successfully, but is a variable.
+    let code = r#"
+    interface ParentIf {
+        var scalar: logic;
+        modport sink {
+            scalar.sink: modport,
+        }
+    }
+    "#;
+
+    // When: every analyzer pass runs.
+    let errors = analyze(code);
+
+    // Then: the root is reference-accounted and pass2 emits one typed kind error
+    // without the reference table adding an undefined-identifier duplicate.
+    let nested: Vec<_> = errors
+        .iter()
+        .filter(|error| matches!(error, AnalyzerError::InvalidNestedModport { .. }))
+        .collect();
+    assert_eq!(nested.len(), 1, "{errors:?}");
+    assert!(
+        matches!(
+            nested[0],
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::NonInterfaceSegment {
+                    segment,
+                    actual_kind,
+                },
+                error_location,
+                ..
+            } if path == "scalar.sink"
+                && segment == "scalar"
+                && actual_kind == "logic"
+                && error_location.offset() == code.find("scalar.sink").unwrap()
+                && error_location.len() == "scalar".len()
+        ),
+        "{errors:?}"
+    );
+    assert!(
+        !errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::UndefinedIdentifier { identifier, .. } if identifier == "scalar"
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_behavior_diagnostics_cover_missing_empty_cycle_and_collision() {
+    let missing_segment = r#"
+    interface ParentIf {
+        modport sink {
+            ghost.sink: modport,
+        }
+    }
+    "#;
+    let errors = analyze(missing_segment);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::MissingInterfaceSegment { segment },
+                error_location,
+                ..
+            } if path == "ghost.sink"
+                && segment == "ghost"
+                && error_location.offset() == missing_segment.find("ghost.sink").unwrap()
+                && error_location.len() == 5
+        )),
+        "{errors:?}"
+    );
+
+    let empty = r#"
+    interface ChildIf {
+        modport empty {}
+    }
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.empty: modport,
+        }
+    }
+    "#;
+    let errors = analyze(empty);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::EmptyModport { name },
+                error_location,
+                ..
+            } if path == "child.empty"
+                && name == "empty"
+                && error_location.offset() == empty.rfind("child.empty").unwrap()
+                && error_location.len() == "child.empty".len()
+        )),
+        "{errors:?}"
+    );
+
+    let cycle = r#"
+    interface ParentIf {
+        modport a {
+            ..same(b)
+        }
+        modport b {
+            ..converse(a)
+        }
+    }
+    "#;
+    let errors = analyze(cycle);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                kind: InvalidNestedModportKind::DefaultCycle { target },
+                error_location,
+                ..
+            } if target == "a" && error_location.offset() == cycle.rfind("a)").unwrap()
+                && error_location.len() == 1
+        )),
+        "{errors:?}"
+    );
+
+    let collision = r#"
+    interface LeafIf {
+        var c: logic;
+        var b__c: logic;
+        modport c_only { c: input, }
+        modport bc_only { b__c: output, }
+    }
+    interface MiddleIf {
+        inst b: LeafIf;
+        modport deep { b.c_only: modport, }
+    }
+    interface ParentIf {
+        inst a__b: LeafIf;
+        inst a: MiddleIf;
+        modport sink {
+            a__b.c_only: modport,
+            a.deep: modport,
+        }
+    }
+    "#;
+    let errors = analyze(collision);
+    assert!(
+        errors.iter().any(|error| matches!(
+            error,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::FlatNameCollision { flat, first_path },
+                first_conflict_location,
+                ..
+            } if path == "a.b.c"
+                && flat == "a__b__c"
+                && first_path == "a__b.c"
+                && first_conflict_location.len() == 1
+        )),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn nested_modport_non_variable_terminal_reports_exact_typed_diagnostic() {
+    let code = r#"
+    interface ChildIf {
+        let ready: logic = 1'b1;
+        modport sink {
+            ready: input,
+        }
+    }
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.sink: modport,
+        }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let diagnostics: Vec<_> = errors
+        .iter()
+        .filter(|error| matches!(error, AnalyzerError::InvalidNestedModport { .. }))
+        .collect();
+    assert_eq!(diagnostics.len(), 1, "{errors:?}");
+    let diagnostic = diagnostics[0];
+    assert!(
+        matches!(
+            diagnostic,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::NonVariableTerminal {
+                    name,
+                    actual_kind,
+                },
+                error_location,
+                first_conflict_location,
+                ..
+            } if path == "child.ready"
+                && name == "child.ready"
+                && actual_kind == "let-bounded variable"
+                && error_location.offset() == code.find("ready: logic").unwrap()
+                && error_location.len() == "ready".len()
+                && first_conflict_location.is_empty()
+        ),
+        "{diagnostic:?}"
+    );
+    assert_eq!(diagnostic.input_sources().sources.len(), 1);
+    assert_eq!(diagnostic.input_sources().sources[0].path, "");
+    assert_eq!(
+        diagnostic.code().map(|code| code.to_string()).as_deref(),
+        Some("invalid_nested_modport")
+    );
+    assert_eq!(
+        diagnostic.to_string(),
+        "cannot lower nested modport \"child.ready\": terminal \"child.ready\" is let-bounded variable, not a plain signal variable"
+    );
+}
+
+#[test]
+fn nested_modport_unemittable_terminal_reports_exact_child_site() {
+    let code = r#"
+    interface ChildIf {
+        var opaque: $sv::Opaque;
+        modport sink { opaque: input, }
+    }
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink { child.sink: modport, }
+    }
+    "#;
+
+    let errors = analyze(code);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let diagnostics: Vec<_> = errors
+        .iter()
+        .filter(|error| matches!(error, AnalyzerError::InvalidNestedModport { .. }))
+        .collect();
+    assert_eq!(diagnostics.len(), 1, "{errors:?}");
+    let diagnostic = diagnostics[0];
+    assert!(
+        matches!(
+            diagnostic,
+            AnalyzerError::InvalidNestedModport {
+                path,
+                kind: InvalidNestedModportKind::UnemittableTerminalType { name, actual_type },
+                error_location,
+                first_conflict_location,
+                ..
+            } if path == "child.opaque"
+                && name == "child.opaque"
+                && actual_type == "systemverilog"
+                && error_location.offset() == code.find("opaque: $sv::Opaque").unwrap()
+                && error_location.len() == "opaque".len()
+                && first_conflict_location.is_empty()
+        ),
+        "{diagnostic:?}"
+    );
+    assert_eq!(diagnostic.input_sources().sources.len(), 1);
+    assert_eq!(diagnostic.input_sources().sources[0].path, "");
+    assert_eq!(
+        diagnostic.code().map(|code| code.to_string()).as_deref(),
+        Some("invalid_nested_modport")
+    );
+    assert_eq!(
+        diagnostic.to_string(),
+        "cannot lower nested modport \"child.opaque\": terminal \"child.opaque\" has unsupported emitted type \"systemverilog\""
+    );
+}
+
+#[test]
+fn nested_terminal_errors_in_foreign_source_fall_back_to_parent_item() {
+    let parent = r#"interface ParentIf {
+    inst child: ChildIf;
+    modport sink { child.sink: modport, }
+}"#;
+    let cases = [
+        (
+            r#"interface ChildIf {
+    let ready: logic = 1'b1;
+    modport sink { ready: input, }
+}"#,
+            "child.ready",
+            InvalidNestedModportKind::NonVariableTerminal {
+                name: "child.ready".to_owned(),
+                actual_kind: "let-bounded variable".to_owned(),
+            },
+            "cannot lower nested modport \"child.ready\": terminal \"child.ready\" is let-bounded variable, not a plain signal variable",
+        ),
+        (
+            r#"interface ChildIf {
+    var opaque: $sv::Opaque;
+    modport sink { opaque: input, }
+}"#,
+            "child.opaque",
+            InvalidNestedModportKind::UnemittableTerminalType {
+                name: "child.opaque".to_owned(),
+                actual_type: "systemverilog".to_owned(),
+            },
+            "cannot lower nested modport \"child.opaque\": terminal \"child.opaque\" has unsupported emitted type \"systemverilog\"",
+        ),
+    ];
+
+    for (child, expected_path, expected_kind, expected_message) in cases {
+        let errors = analyze_multiple_inputs(&[child, parent]);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let diagnostics: Vec<_> = errors
+            .iter()
+            .filter(|error| matches!(error, AnalyzerError::InvalidNestedModport { .. }))
+            .collect();
+        assert_eq!(diagnostics.len(), 1, "{errors:?}");
+        let diagnostic = diagnostics[0];
+        assert!(
+            matches!(
+                diagnostic,
+                AnalyzerError::InvalidNestedModport {
+                    path,
+                    kind,
+                    error_location,
+                    first_conflict_location,
+                    ..
+                } if path == expected_path
+                    && kind == &expected_kind
+                    && error_location.offset() == parent.find("child.sink").unwrap()
+                    && error_location.len() == "child.sink".len()
+                    && first_conflict_location.is_empty()
+            ),
+            "{diagnostic:?}"
+        );
+        assert_eq!(diagnostic.input_sources().sources.len(), 1);
+        assert_eq!(diagnostic.input_sources().sources[0].path, "test_1.veryl");
+        assert_eq!(
+            diagnostic.code().map(|code| code.to_string()).as_deref(),
+            Some("invalid_nested_modport")
+        );
+        assert_eq!(diagnostic.to_string(), expected_message);
+    }
 }
 
 #[test]

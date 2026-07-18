@@ -5,7 +5,7 @@ mod msb;
 
 use crate::analyzer_error::DuplicatedIdentifierKind;
 use crate::namespace::{DefineContext, Namespace};
-use crate::scope;
+use crate::scope::{self, ScopeId};
 use crate::sv_system_function;
 use crate::symbol::{
     ConnectTarget, Direction, DocComment, GenericBoundKind, GenericMap, GenericTable,
@@ -184,6 +184,7 @@ pub struct SymbolTable {
     name_table: HashMap<StrId, Vec<SymbolId>>,
     symbol_table: HashMap<SymbolId, Rc<Symbol>>,
     namespace_index: HashMap<SVec<StrId>, Vec<SymbolId>>,
+    owner_emission_index: HashMap<ScopeId, Vec<SymbolId>>,
     project_local_table: HashMap<StrId, HashMap<StrId, StrId>>,
     import_list: Vec<Import>,
     bind_list: Vec<Bind>,
@@ -241,9 +242,31 @@ impl SymbolTable {
         let id = symbol.id;
         let scope = symbol.scope;
         let ns_paths = symbol.namespace.paths.clone();
+        let owner_emission_scope = match &symbol.kind {
+            SymbolKind::Port(_)
+            | SymbolKind::Variable(_)
+            | SymbolKind::Function(_)
+            | SymbolKind::Parameter(_)
+            | SymbolKind::Instance(_)
+            | SymbolKind::Block
+            | SymbolKind::Struct(_)
+            | SymbolKind::Union(_)
+            | SymbolKind::TypeDef(_)
+            | SymbolKind::Enum(_)
+            | SymbolKind::GenericParameter(_)
+            | SymbolKind::GenericConst(_) => Some(scope::intern_namespace(&symbol.namespace)),
+            SymbolKind::Genvar => scope::parent(symbol.scope),
+            _ => None,
+        };
         entry.push(id);
         self.symbol_table.insert(id, Rc::new(symbol));
         self.namespace_index.entry(ns_paths).or_default().push(id);
+        if let Some(owner_scope) = owner_emission_scope {
+            self.owner_emission_index
+                .entry(owner_scope)
+                .or_default()
+                .push(id);
+        }
         // Mirror the binding into the scope tree so lexical lookup sees every
         // inserted symbol regardless of which path created it.
         scope::add_local(scope, token.text, id);
@@ -1566,10 +1589,20 @@ impl SymbolTable {
         for (_, symbols) in self.name_table.iter_mut() {
             symbols.retain(|x| !drop_list.contains(x));
         }
+        for symbols in self.owner_emission_index.values_mut() {
+            symbols.retain(|x| !drop_list.contains(x));
+        }
 
         for tokens in self.reference_table.values_mut() {
             tokens.retain(|x| x.source != file_path);
         }
+    }
+
+    fn owner_emission_candidates(&self, scope: ScopeId) -> Vec<SymbolId> {
+        self.owner_emission_index
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default()
     }
 
     pub fn add_reference(&mut self, target: SymbolId, token: &Token) {
@@ -2776,6 +2809,10 @@ pub fn get_all() -> Vec<Symbol> {
     SYMBOL_TABLE.with(|f| f.borrow().get_all())
 }
 
+pub(crate) fn owner_emission_candidates(scope: ScopeId) -> Vec<SymbolId> {
+    SYMBOL_TABLE.with(|table| table.borrow().owner_emission_candidates(scope))
+}
+
 pub fn dump() -> String {
     SYMBOL_TABLE.with(|f| f.borrow().dump())
 }
@@ -2791,6 +2828,7 @@ pub fn add_reference(target: SymbolId, token: &Token) {
 
 pub fn add_generic_instance(target: SymbolId, instance: SymbolId) {
     clear_cache();
+    crate::nested_modport::clear_canonical_generic_map_cache();
     SYMBOL_TABLE.with(|f| f.borrow_mut().add_generic_instance(target, instance))
 }
 
@@ -2901,6 +2939,7 @@ pub fn restore_fragment(fragment: SymbolTableFragment) -> Result<(), Box<Symbol>
 pub fn clear() {
     clear_resolve_caches();
     GENERIC_INSTANCE_INDEX.with(|f| f.borrow_mut().clear());
+    crate::nested_modport::clear_canonical_generic_map_cache();
     SYMBOL_TABLE.with(|f| f.borrow_mut().clear())
 }
 

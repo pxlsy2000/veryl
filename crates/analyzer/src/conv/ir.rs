@@ -1,3 +1,6 @@
+use crate::analyzer_error::{
+    ExceedLimitKind, InvalidNestedModportKind, NestedModportDiagnosticSite,
+};
 use crate::conv::checker::alias::{AliasType, check_alias_target};
 use crate::conv::checker::clock_domain::check_clock_domain;
 use crate::conv::checker::generic::check_generic_bound;
@@ -5,9 +8,15 @@ use crate::conv::checker::proto::check_proto;
 use crate::conv::utils::{check_module_with_unevaluable_generic_parameters, get_component};
 use crate::conv::{Affiliation, Context, Conv};
 use crate::ir::{self, IrResult, VarPath};
+use crate::nested_modport::{
+    EmissionOwnerKind, LoweringAvailability, NestedLoweringResolveError, NestedModportLoweringKey,
+    PendingGenericEmissionOwner, resolve_direct_modport_effective_with_index,
+    resolve_pending_nested_modport_lowering_for_owner_with_index,
+};
 use crate::symbol::SymbolKind;
 use crate::symbol_table;
-use crate::{HashMap, ir_error};
+use crate::{AnalyzerError, HashMap, ir_error};
+use std::sync::Arc;
 use veryl_parser::token_range::TokenRange;
 use veryl_parser::veryl_grammar_trait::*;
 
@@ -143,7 +152,7 @@ impl Conv<&Veryl> for ir::Ir {
 
 fn conv_global_function(context: &mut Context, value: &FunctionDeclaration) {
     let upper_context = context;
-    let mut context = Context::default();
+    let mut context = upper_context.child();
     context.inherit(upper_context);
 
     context.in_global_func = Some(value.identifier.identifier_token.token);
@@ -167,7 +176,7 @@ impl Conv<(&ModuleDeclaration, bool)> for ir::Module {
 
         // each top-level component has independent context
         let upper_context = context;
-        let mut context = Context::default();
+        let mut context = upper_context.child();
         context.inherit(upper_context);
 
         let _guard = context.conv_profile_guard(module_declaration.identifier.text());
@@ -179,6 +188,14 @@ impl Conv<(&ModuleDeclaration, bool)> for ir::Module {
             && let SymbolKind::Module(x) = &symbol.found.kind
             && !x.is_proto
         {
+            let owner = context
+                .get_current_signature()
+                .cloned()
+                .unwrap_or_else(|| ir::Signature::new(symbol.found.id));
+            context.set_component_emission_specialization(
+                context.component_specialization_identity(&owner),
+            );
+            context.set_emission_owner_signature(owner);
             context.push_namespace(symbol.found.inner_namespace());
             context.in_test_module = x.test.is_some();
             if let Some(x) = x.default_clock {
@@ -271,6 +288,59 @@ impl Conv<(&ModuleDeclaration, bool)> for ir::Module {
             }
         }
 
+        let declaration = module_declaration.identifier.identifier_token.token;
+        let resolved_symbol = symbol_table::resolve(module_declaration.identifier.as_ref())
+            .map_err(|_| ir_error!(TokenRange::from(module_declaration.identifier.as_ref())))?;
+        let current_signature = context.get_current_signature().cloned();
+        if context.in_generic
+            && current_signature.is_none()
+            && let Some(source) = declaration.source.get_path()
+            && let Err(error) =
+                context.record_nested_generic_emission_owner(PendingGenericEmissionOwner {
+                    session: context.analysis_session_id(),
+                    source,
+                    declaration: declaration.id,
+                    kind: EmissionOwnerKind::Module,
+                    symbol: resolved_symbol.found.id,
+                })
+        {
+            context.insert_error(AnalyzerError::from(error));
+            return Err(ir_error!(TokenRange::from(
+                module_declaration.identifier.as_ref()
+            )));
+        }
+        if !context.in_generic
+            && (current_signature.is_some() || !resolved_symbol.found.has_generic_paramters())
+            && let Some(source) = declaration.source.get_path()
+        {
+            let owner =
+                current_signature.unwrap_or_else(|| ir::Signature::new(resolved_symbol.found.id));
+            let specialization = NestedModportLoweringKey {
+                session: context.analysis_session_id(),
+                specialization: (context.component_specialization_identity(&owner)).into(),
+            };
+            if let Err(error) = context
+                .record_nested_lowering(specialization.clone(), LoweringAvailability::NotNested)
+            {
+                context.insert_error(AnalyzerError::from(error));
+                return Err(ir_error!(TokenRange::from(
+                    module_declaration.identifier.as_ref()
+                )));
+            }
+            if let Err(error) = context.record_nested_emission_owner(
+                source,
+                declaration.id,
+                EmissionOwnerKind::Module,
+                specialization,
+                LoweringAvailability::NotNested,
+            ) {
+                context.insert_error(AnalyzerError::from(error));
+                return Err(ir_error!(TokenRange::from(
+                    module_declaration.identifier.as_ref()
+                )));
+            }
+        }
+
         context.pop_namespace();
         upper_context.inherit(&mut context);
 
@@ -294,7 +364,7 @@ impl Conv<&InterfaceDeclaration> for ir::Interface {
     fn conv(context: &mut Context, value: &InterfaceDeclaration) -> IrResult<Self> {
         // each top-level component has independent context
         let upper_context = context;
-        let mut context = Context::default();
+        let mut context = upper_context.child();
         context.inherit(upper_context);
 
         let _guard = context.conv_profile_guard(value.identifier.text());
@@ -305,6 +375,14 @@ impl Conv<&InterfaceDeclaration> for ir::Interface {
         if let Ok(symbol) = symbol_table::resolve(value.identifier.as_ref())
             && matches!(symbol.found.kind, SymbolKind::Interface(ref x) if !x.is_proto)
         {
+            let owner = context
+                .get_current_signature()
+                .cloned()
+                .unwrap_or_else(|| ir::Signature::new(symbol.found.id));
+            context.set_component_emission_specialization(
+                context.component_specialization_identity(&owner),
+            );
+            context.set_emission_owner_signature(owner);
             context.push_namespace(symbol.found.inner_namespace());
         } else {
             let token: TokenRange = value.identifier.as_ref().into();
@@ -336,56 +414,312 @@ impl Conv<&InterfaceDeclaration> for ir::Interface {
             }
         }
 
-        context.with_nested_modport_flat_name_scope(|context| {
-            for x in &value.interface_declaration_list {
-                let items: Vec<_> = x.interface_group.as_ref().into();
-                for item in items {
-                    match item {
-                        InterfaceItem::GenerateItem(x) => {
-                            let _: IrResult<ir::DeclarationBlock> =
-                                Conv::conv(context, x.generate_item.as_ref());
-                        }
-                        InterfaceItem::ModportDeclaration(x) => {
-                            let _: IrResult<()> =
-                                Conv::conv(context, x.modport_declaration.as_ref());
-                        }
+        for x in &value.interface_declaration_list {
+            let items: Vec<_> = x.interface_group.as_ref().into();
+            for item in items {
+                match item {
+                    InterfaceItem::GenerateItem(x) => {
+                        let _: IrResult<ir::DeclarationBlock> =
+                            Conv::conv(&mut context, x.generate_item.as_ref());
+                    }
+                    InterfaceItem::ModportDeclaration(x) => {
+                        let _: IrResult<()> =
+                            Conv::conv(&mut context, x.modport_declaration.as_ref());
                     }
                 }
             }
-
-            Ok(())
-        })?;
+        }
 
         let var_paths = context.drain_var_paths();
         let func_paths = context.drain_func_paths();
         let mut variables = context.drain_variables();
         let functions = context.drain_functions();
         let modports = context.drain_modports();
+        let pending_component_lowering = context.drain_pending_component_lowering();
 
         let variables = variables
             .extract_if(|_, v| v.affiliation != Affiliation::Function)
             .collect();
+        let terminal_index = context.drain_instantiated_terminal_index(&variables, &functions);
+
+        let diagnostic_token: TokenRange = value.identifier.as_ref().into();
+        let owner_signature = if let Some(signature) = context.get_current_signature() {
+            signature.clone()
+        } else if let Ok(symbol) = symbol_table::resolve(value.identifier.as_ref()) {
+            ir::Signature::new(symbol.found.id)
+        } else {
+            return Err(ir_error!(diagnostic_token));
+        };
+        let lowering_key = NestedModportLoweringKey {
+            session: context.analysis_session_id(),
+            specialization: (context.component_specialization_identity(&owner_signature)).into(),
+        };
+        let requires_nested_lowering = pending_component_lowering
+            .declarations
+            .iter()
+            .any(|declaration| declaration.contains_nested_item);
+        let availability;
+        let interface_modports = if requires_nested_lowering {
+            let lowering = match resolve_pending_nested_modport_lowering_for_owner_with_index(
+                &pending_component_lowering,
+                &variables,
+                &functions,
+                &terminal_index,
+                Some(owner_signature.symbol),
+                context.config.evaluate_size_limit,
+            ) {
+                Ok(Some(lowering)) => lowering,
+                Ok(None) => {
+                    context.insert_error(AnalyzerError::from(
+                        crate::nested_modport::NestedModportAnalysisInvariant::MissingLowering,
+                    ));
+                    context.pop_namespace();
+                    upper_context.inherit(&mut context);
+                    return Err(ir_error!(diagnostic_token));
+                }
+                Err(error) => {
+                    insert_nested_lowering_error(&mut context, error, diagnostic_token);
+                    context.pop_namespace();
+                    upper_context.inherit(&mut context);
+                    return Err(ir_error!(diagnostic_token));
+                }
+            };
+            let lowering =
+                match context.record_nested_interface_lowering(lowering_key.clone(), lowering) {
+                    Ok(lowering) => lowering,
+                    Err(error) => {
+                        context.insert_error(AnalyzerError::from(error));
+                        context.pop_namespace();
+                        upper_context.inherit(&mut context);
+                        return Err(ir_error!(diagnostic_token));
+                    }
+                };
+            availability = LoweringAvailability::Found(Arc::clone(&lowering));
+            ir::InterfaceModports::Nested(lowering)
+        } else {
+            let effective = match resolve_direct_modport_effective_with_index(
+                &pending_component_lowering,
+                &variables,
+                &functions,
+                &terminal_index,
+                context.config.evaluate_size_limit,
+            ) {
+                Ok(effective) => effective,
+                Err(error) => {
+                    insert_nested_lowering_error(&mut context, error, diagnostic_token);
+                    context.pop_namespace();
+                    upper_context.inherit(&mut context);
+                    return Err(ir_error!(diagnostic_token));
+                }
+            };
+            if let Err(error) = context
+                .record_nested_lowering(lowering_key.clone(), LoweringAvailability::NotNested)
+            {
+                context.insert_error(AnalyzerError::from(error));
+                context.pop_namespace();
+                upper_context.inherit(&mut context);
+                return Err(ir_error!(diagnostic_token));
+            }
+            availability = LoweringAvailability::NotNested;
+            ir::InterfaceModports::direct_legacy_with_effective(modports, effective)
+        };
+
+        let declaration = value.identifier.identifier_token.token;
+        let resolved_symbol = symbol_table::resolve(value.identifier.as_ref())
+            .map_err(|_| ir_error!(diagnostic_token))?;
+        let current_signature = context.get_current_signature().cloned();
+        if context.in_generic
+            && current_signature.is_none()
+            && let Some(source) = declaration.source.get_path()
+            && let Err(error) =
+                context.record_nested_generic_emission_owner(PendingGenericEmissionOwner {
+                    session: context.analysis_session_id(),
+                    source,
+                    declaration: declaration.id,
+                    kind: EmissionOwnerKind::Interface,
+                    symbol: resolved_symbol.found.id,
+                })
+        {
+            context.insert_error(AnalyzerError::from(error));
+            context.pop_namespace();
+            upper_context.inherit(&mut context);
+            return Err(ir_error!(diagnostic_token));
+        }
+        if !context.in_generic
+            && (current_signature.is_some() || !resolved_symbol.found.has_generic_paramters())
+            && let Some(source) = declaration.source.get_path()
+            && let Err(error) = context.record_nested_emission_owner(
+                source,
+                declaration.id,
+                EmissionOwnerKind::Interface,
+                lowering_key,
+                availability,
+            )
+        {
+            context.insert_error(AnalyzerError::from(error));
+            return Err(ir_error!(diagnostic_token));
+        }
 
         context.pop_namespace();
         upper_context.inherit(&mut context);
 
         Ok(ir::Interface {
             name: value.identifier.text(),
-            has_imports: !value.collect_import_declarations().is_empty(),
             var_paths,
             func_paths,
             variables,
             functions,
-            modports,
+            modports: interface_modports,
         })
     }
+}
+
+fn insert_nested_lowering_error(
+    context: &mut Context,
+    error: NestedLoweringResolveError,
+    token: TokenRange,
+) {
+    let (path, kind, site) = match error {
+        NestedLoweringResolveError::ExpansionBudget { requested, .. } => {
+            context.insert_error(AnalyzerError::exceed_limit(
+                ExceedLimitKind::EvaluateSize,
+                requested,
+                &token,
+            ));
+            return;
+        }
+        NestedLoweringResolveError::MissingTerminal { path, origin } => {
+            let name = path.to_string();
+            (
+                name.clone(),
+                InvalidNestedModportKind::NonVariableTerminal {
+                    name,
+                    actual_kind: "missing terminal".to_string(),
+                },
+                NestedModportDiagnosticSite {
+                    item_path: origin,
+                    offending: origin,
+                    first_conflict: None,
+                },
+            )
+        }
+        NestedLoweringResolveError::MissingModport { name, origin } => (
+            name.to_string(),
+            InvalidNestedModportKind::MissingModport {
+                name: name.to_string(),
+            },
+            NestedModportDiagnosticSite {
+                item_path: token,
+                offending: origin,
+                first_conflict: None,
+            },
+        ),
+        NestedLoweringResolveError::DefaultCycle { target, origin } => (
+            target.to_string(),
+            InvalidNestedModportKind::DefaultCycle {
+                target: target.to_string(),
+            },
+            NestedModportDiagnosticSite {
+                item_path: token,
+                offending: origin,
+                first_conflict: None,
+            },
+        ),
+        NestedLoweringResolveError::EmptyModport { name, origin } => (
+            name.to_string(),
+            InvalidNestedModportKind::EmptyModport {
+                name: name.to_string(),
+            },
+            NestedModportDiagnosticSite {
+                item_path: origin,
+                offending: origin,
+                first_conflict: None,
+            },
+        ),
+        NestedLoweringResolveError::UnsupportedMemberDirection {
+            path,
+            direction,
+            origin,
+        } => (
+            path.to_string(),
+            InvalidNestedModportKind::UnsupportedMemberDirection {
+                direction: direction.to_string(),
+            },
+            NestedModportDiagnosticSite {
+                item_path: origin,
+                offending: origin,
+                first_conflict: None,
+            },
+        ),
+        NestedLoweringResolveError::NonVariableTerminal {
+            path,
+            actual_kind,
+            origin,
+            terminal,
+        } => {
+            let name = path.to_string();
+            (
+                name.clone(),
+                InvalidNestedModportKind::NonVariableTerminal { name, actual_kind },
+                NestedModportDiagnosticSite {
+                    item_path: origin,
+                    offending: if terminal.beg.source == origin.beg.source {
+                        terminal
+                    } else {
+                        origin
+                    },
+                    first_conflict: None,
+                },
+            )
+        }
+        NestedLoweringResolveError::UnemittableTerminal {
+            path,
+            actual_type,
+            origin,
+            terminal,
+        } => {
+            let name = path.to_string();
+            (
+                name.clone(),
+                InvalidNestedModportKind::UnemittableTerminalType { name, actual_type },
+                NestedModportDiagnosticSite {
+                    item_path: origin,
+                    offending: if terminal.beg.source == origin.beg.source {
+                        terminal
+                    } else {
+                        origin
+                    },
+                    first_conflict: None,
+                },
+            )
+        }
+        NestedLoweringResolveError::FlatNameCollision {
+            flat,
+            first_path,
+            second_path,
+            first_origin,
+            second_origin,
+        } => (
+            second_path.to_string(),
+            InvalidNestedModportKind::FlatNameCollision {
+                flat: flat.to_string(),
+                first_path: first_path.to_string(),
+            },
+            NestedModportDiagnosticSite {
+                item_path: second_origin,
+                offending: second_origin,
+                first_conflict: Some(first_origin),
+            },
+        ),
+    };
+    context.insert_error(AnalyzerError::invalid_nested_modport(&path, kind, &site));
 }
 
 impl Conv<&PackageDeclaration> for () {
     fn conv(context: &mut Context, value: &PackageDeclaration) -> IrResult<Self> {
         // each top-level component has independent context
         let upper_context = context;
-        let mut context = Context::default();
+        let mut context = upper_context.child();
         context.inherit(upper_context);
 
         let _guard = context.conv_profile_guard(value.identifier.text());
@@ -442,7 +776,7 @@ impl Conv<&ProtoModuleDeclaration> for ir::Module {
     fn conv(context: &mut Context, value: &ProtoModuleDeclaration) -> IrResult<Self> {
         // each top-level component has independent context
         let upper_context = context;
-        let mut context = Context::default();
+        let mut context = upper_context.child();
         context.inherit(upper_context);
 
         // pop_affiliation is not necessary because the local `context` will be dropped

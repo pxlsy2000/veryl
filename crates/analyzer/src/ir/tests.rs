@@ -986,11 +986,14 @@ fn nested_modport_forwarding_ir() {
         ]
     );
 
+    assert!(matches!(
+        interface.modports,
+        crate::ir::InterfaceModports::Nested(_)
+    ));
     let mut sink: Vec<_> = interface
-        .modports
-        .get(&resource_table::insert_str("sink"))
+        .get_modport(&resource_table::insert_str("sink"))
         .unwrap()
-        .iter()
+        .iter_paths_directions()
         .map(|(path, direction)| (path.to_string(), *direction))
         .collect();
     sink.sort();
@@ -1007,10 +1010,9 @@ fn nested_modport_forwarding_ir() {
     );
 
     let mut source: Vec<_> = interface
-        .modports
-        .get(&resource_table::insert_str("source"))
+        .get_modport(&resource_table::insert_str("source"))
         .unwrap()
-        .iter()
+        .iter_paths_directions()
         .map(|(path, direction)| (path.to_string(), *direction))
         .collect();
     source.sort();
@@ -1023,6 +1025,953 @@ fn nested_modport_forwarding_ir() {
             ("cpu.mask".to_string(), Direction::Output),
         ]
     );
+}
+
+#[test]
+fn nested_modport_generic_terminals_use_instantiated_types_and_share_pending_arc() {
+    let code = r#"
+    interface ChildIf::<W: u32> {
+        var payload: logic<W> [2];
+        modport sink {
+            payload: input,
+        }
+    }
+    package UnrelatedPkg {
+        const VALUE: u32 = 1;
+    }
+    interface ParentIf {
+        import UnrelatedPkg::*;
+        inst child8: ChildIf::<8>;
+        inst child16: ChildIf::<16>;
+        inst unrelated: ChildIf::<32>;
+        modport sink {
+            child8.sink: modport,
+            child16.sink: modport,
+        }
+    }
+    module Top {
+        inst parent: ParentIf;
+    }
+    "#;
+
+    symbol_table::clear();
+    attribute_table::clear();
+    let metadata = Metadata::create_default("prj").unwrap();
+    let parser = Parser::parse(code, &"").unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+    let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+    errors.append(&mut Analyzer::analyze_post_pass1());
+    errors.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error, AnalyzerError::UnassignVariable { .. })),
+        "{errors:?}"
+    );
+
+    let parent_name = resource_table::insert_str("ParentIf");
+    let parent_symbol = symbol_table::get_all()
+        .into_iter()
+        .find(|symbol| {
+            symbol.token.text == parent_name && matches!(symbol.kind, SymbolKind::Interface(_))
+        })
+        .expect("ParentIf symbol should exist");
+    let signature = Signature::new(parent_symbol.id);
+    let component = get_component(&mut context, &signature, parent_symbol.token.into())
+        .expect("ParentIf component should resolve");
+    let Component::Interface(interface) = component.as_ref() else {
+        panic!("expected ParentIf interface component");
+    };
+    let crate::ir::InterfaceModports::Nested(lowering) = &interface.modports else {
+        panic!("nested ParentIf must own its lowering");
+    };
+
+    let terminal8 = lowering
+        .terminals
+        .iter()
+        .find(|terminal| terminal.identifier.logical.to_string() == "child8__payload")
+        .expect("8-bit terminal should exist");
+    let terminal16 = lowering
+        .terminals
+        .iter()
+        .find(|terminal| terminal.identifier.logical.to_string() == "child16__payload")
+        .expect("16-bit terminal should exist");
+    assert_eq!(
+        terminal8.resolved_type.declaration.packed.as_slice(),
+        &[Some(8)]
+    );
+    assert_eq!(
+        terminal16.resolved_type.declaration.packed.as_slice(),
+        &[Some(16)]
+    );
+    assert_eq!(
+        terminal8.resolved_type.declaration.unpacked.as_slice(),
+        &[Some(2)]
+    );
+    assert_eq!(lowering.terminals.len(), 2);
+
+    let key = crate::nested_modport::NestedModportLoweringKey {
+        session: context.analysis_session_id(),
+        specialization: context.component_specialization_identity(&signature).into(),
+    };
+    let pending = context.pending_nested_modport_analysis();
+    let pending = pending
+        .lock()
+        .expect("pending lowering mutex should be healthy");
+    let pending_lowering = pending
+        .interface_lowering(&key)
+        .expect("pending analysis should own the interface lowering");
+    assert!(std::sync::Arc::ptr_eq(lowering, pending_lowering));
+    assert!(pending.lowering(&key).is_none());
+    drop(pending);
+
+    let repeated = get_component(&mut context, &signature, parent_symbol.token.into())
+        .expect("cached ParentIf component should resolve");
+    assert!(std::sync::Arc::ptr_eq(&component, &repeated));
+    let Component::Interface(repeated_interface) = repeated.as_ref() else {
+        panic!("expected cached ParentIf interface component");
+    };
+    let crate::ir::InterfaceModports::Nested(repeated_lowering) = &repeated_interface.modports
+    else {
+        panic!("cached nested ParentIf must retain its lowering");
+    };
+    assert!(std::sync::Arc::ptr_eq(lowering, repeated_lowering));
+}
+
+#[test]
+fn parsed_nested_lowering_semantic_work_scales_with_expanded_terminals() {
+    fn measure(
+        count: usize,
+        scan_mutation: bool,
+    ) -> (
+        usize,
+        (Vec<(String, Vec<Option<usize>>)>, Vec<Vec<String>>),
+        Vec<String>,
+    ) {
+        let mut code = String::from(
+            "interface ChildIf::<W: u32> {\nvar payload: logic<W>;\nmodport sink { payload: input, }\n}\ninterface ParentIf {\n",
+        );
+        for index in 0..count {
+            code.push_str(&format!("inst child{index}: ChildIf::<{}>;\n", index + 1));
+        }
+        for index in 0..count {
+            code.push_str(&format!("var direct{index}: logic;\n"));
+        }
+        code.push_str("modport sink {\n");
+        for index in 0..count {
+            code.push_str(&format!("child{index}.sink: modport,\n"));
+        }
+        for index in 0..count {
+            code.push_str(&format!("direct{index}: input,\n"));
+        }
+        code.push_str("}\n}\n");
+        symbol_table::clear();
+        attribute_table::clear();
+        let metadata = Metadata::create_default("prj").expect("metadata");
+        let parser = Parser::parse(&code, &"real_lowering_scale.veryl").expect("fixture parses");
+        let analyzer = Analyzer::new(&metadata);
+        let mut context = Context::default();
+        let mut ir = Ir::default();
+        let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+        errors.append(&mut Analyzer::analyze_post_pass1());
+        crate::nested_modport::reset_terminal_resolution_work();
+        let mut pass2_errors = if scan_mutation {
+            crate::nested_modport::with_terminal_resolution_scan_mutation(|| {
+                analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir))
+            })
+        } else {
+            analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir))
+        };
+        errors.append(&mut pass2_errors);
+        let construction_work = crate::nested_modport::terminal_resolution_work();
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, AnalyzerError::UnassignVariable { .. })),
+            "{errors:?}"
+        );
+        let parent_name = resource_table::insert_str("ParentIf");
+        let parent = symbol_table::get_all()
+            .into_iter()
+            .find(|symbol| {
+                symbol.token.text == parent_name && matches!(symbol.kind, SymbolKind::Interface(_))
+            })
+            .expect("ParentIf symbol");
+        let component = get_component(
+            &mut context,
+            &Signature::new(parent.id),
+            parent.token.into(),
+        )
+        .expect("ParentIf component");
+        let Component::Interface(interface) = component.as_ref() else {
+            panic!("ParentIf interface")
+        };
+        let crate::ir::InterfaceModports::Nested(lowering) = &interface.modports else {
+            panic!("nested lowering")
+        };
+        assert_eq!(lowering.terminals.len(), count);
+        let terminal_snapshot = lowering
+            .terminals
+            .iter()
+            .map(|terminal| {
+                (
+                    terminal.identifier.logical.to_string(),
+                    terminal
+                        .resolved_type
+                        .declaration
+                        .packed
+                        .as_slice()
+                        .to_vec(),
+                )
+            })
+            .collect();
+        let sink = resource_table::insert_str("sink");
+        let entry_snapshot = lowering
+            .modports
+            .get(&sink)
+            .expect("nested sink")
+            .entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .as_slice()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entry_snapshot.len(), 2 * count);
+        if count >= 16 {
+            assert!(lowering.terminals.iter().any(|terminal| {
+                terminal.resolved_type.declaration.packed.as_slice() == [Some(8)]
+            }));
+            assert!(lowering.terminals.iter().any(|terminal| {
+                terminal.resolved_type.declaration.packed.as_slice() == [Some(16)]
+            }));
+        }
+        let diagnostics = errors.iter().map(ToString::to_string).collect();
+        (
+            construction_work,
+            (terminal_snapshot, entry_snapshot),
+            diagnostics,
+        )
+    }
+
+    let normal = [8, 16, 32].map(|count| measure(count, false));
+    let mutation = [8, 16, 32].map(|count| measure(count, true));
+    for index in 0..normal.len() {
+        assert_eq!(normal[index].1, mutation[index].1);
+        assert_eq!(normal[index].2, mutation[index].2);
+    }
+    let work = normal.map(|measurement| measurement.0);
+    let mutation_work = mutation.map(|measurement| measurement.0);
+    println!("parsed nested indexed={work:?} scan mutation={mutation_work:?}");
+    assert!(work[0] > 0);
+    assert!(work[1] > work[0]);
+    assert!(work[2] > work[1]);
+    assert!(work[1] <= 3 * work[0]);
+    assert!(work[2] <= 3 * work[1]);
+    assert!(mutation_work[2] > 3 * mutation_work[1]);
+}
+
+#[test]
+fn parsed_direct_lowering_construction_scales_with_entries_and_variables() {
+    fn measure(
+        count: usize,
+        scan_mutation: bool,
+    ) -> (usize, Vec<(Vec<String>, bool)>, Vec<String>) {
+        let mut code = String::from("interface DirectIf {\n");
+        for index in 0..count {
+            code.push_str(&format!("var item{index}: logic;\n"));
+        }
+        code.push_str("modport sink {\n");
+        for index in 0..count {
+            code.push_str(&format!("item{index}: input,\n"));
+        }
+        code.push_str("}\n}\n");
+        symbol_table::clear();
+        attribute_table::clear();
+        let metadata = Metadata::create_default("prj").expect("metadata");
+        let parser = Parser::parse(&code, &"direct_lowering_scale.veryl").expect("fixture parses");
+        let analyzer = Analyzer::new(&metadata);
+        let mut context = Context::default();
+        let mut ir = Ir::default();
+        let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+        errors.append(&mut Analyzer::analyze_post_pass1());
+        crate::nested_modport::reset_terminal_resolution_work();
+        let mut pass2_errors = if scan_mutation {
+            crate::nested_modport::with_terminal_resolution_scan_mutation(|| {
+                analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir))
+            })
+        } else {
+            analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir))
+        };
+        errors.append(&mut pass2_errors);
+        let construction_work = crate::nested_modport::terminal_resolution_work();
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, AnalyzerError::UnassignVariable { .. })),
+            "{errors:?}"
+        );
+        let name = resource_table::insert_str("DirectIf");
+        let direct = symbol_table::get_all()
+            .into_iter()
+            .find(|symbol| {
+                symbol.token.text == name && matches!(symbol.kind, SymbolKind::Interface(_))
+            })
+            .expect("DirectIf symbol");
+        let component = get_component(
+            &mut context,
+            &Signature::new(direct.id),
+            direct.token.into(),
+        )
+        .expect("DirectIf component");
+        let Component::Interface(interface) = component.as_ref() else {
+            panic!("DirectIf interface")
+        };
+        let sink = resource_table::insert_str("sink");
+        let entries = interface.get_modport(&sink).expect("direct sink").entries();
+        assert_eq!(entries.len(), count);
+        assert!(entries.iter().all(|entry| entry.terminal_site.is_some()));
+        let snapshot = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry
+                        .path
+                        .as_slice()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    entry.terminal_site.is_some(),
+                )
+            })
+            .collect();
+        let diagnostics = errors.iter().map(ToString::to_string).collect();
+        (construction_work, snapshot, diagnostics)
+    }
+
+    let normal = [8, 16, 32].map(|count| measure(count, false));
+    let mutation = [8, 16, 32].map(|count| measure(count, true));
+    for index in 0..normal.len() {
+        assert_eq!(normal[index].1, mutation[index].1);
+        assert_eq!(normal[index].2, mutation[index].2);
+    }
+    let work = normal.map(|measurement| measurement.0);
+    let mutation_work = mutation.map(|measurement| measurement.0);
+    println!("parsed direct indexed={work:?} scan mutation={mutation_work:?}");
+    assert!(work[0] > 0);
+    assert!(work[1] > work[0]);
+    assert!(work[2] > work[1]);
+    assert!(work[1] <= 3 * work[0]);
+    assert!(work[2] <= 3 * work[1]);
+    assert!(mutation_work[2] > 3 * mutation_work[1]);
+}
+
+#[test]
+fn failed_nested_owner_leaves_no_cache_or_pending_lowering_before_successful_owner() {
+    let code = r#"
+    interface ChildIf {
+        var ready: logic;
+        modport sink {
+            ready: input,
+        }
+    }
+    interface BadParentIf {
+        inst child: ChildIf;
+        var opaque: $sv::Opaque;
+        modport sink {
+            child.sink: modport,
+            opaque: input,
+        }
+    }
+    interface GoodParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.sink: modport,
+        }
+    }
+    "#;
+
+    symbol_table::clear();
+    attribute_table::clear();
+    let metadata = Metadata::create_default("prj").unwrap();
+    let parser = Parser::parse(code, &"").unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+    let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+    errors.append(&mut Analyzer::analyze_post_pass1());
+    errors.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+
+    let diagnostic = errors
+        .iter()
+        .find(|error| {
+            matches!(
+                error,
+                AnalyzerError::InvalidNestedModport {
+                    path,
+                    kind: crate::analyzer_error::InvalidNestedModportKind::UnemittableTerminalType {
+                        name,
+                        actual_type,
+                    },
+                    error_location,
+                    ..
+                } if path == "opaque"
+                    && name == "opaque"
+                    && actual_type == "systemverilog"
+                    && error_location.offset() == code.find("opaque: $sv::Opaque").unwrap()
+                    && error_location.len() == "opaque".len()
+            )
+        })
+        .expect("nested owner must report the typed unemittable-terminal diagnostic");
+    assert_eq!(
+        diagnostic.to_string(),
+        "cannot lower nested modport \"opaque\": terminal \"opaque\" has unsupported emitted type \"systemverilog\""
+    );
+
+    let find_interface = |name: &str| {
+        let name = resource_table::insert_str(name);
+        symbol_table::get_all()
+            .into_iter()
+            .find(|symbol| {
+                symbol.token.text == name && matches!(symbol.kind, SymbolKind::Interface(_))
+            })
+            .expect("interface symbol should exist")
+    };
+    let bad_symbol = find_interface("BadParentIf");
+    let good_symbol = find_interface("GoodParentIf");
+    let bad_signature = Signature::new(bad_symbol.id);
+    let good_signature = Signature::new(good_symbol.id);
+    assert!(context.get_instance_history(&bad_signature).is_none());
+    assert!(context.get_instance_history(&good_signature).is_some());
+
+    let bad_key = crate::nested_modport::NestedModportLoweringKey {
+        session: context.analysis_session_id(),
+        specialization: context
+            .component_specialization_identity(&bad_signature)
+            .into(),
+    };
+    let good_key = crate::nested_modport::NestedModportLoweringKey {
+        session: context.analysis_session_id(),
+        specialization: context
+            .component_specialization_identity(&good_signature)
+            .into(),
+    };
+    let pending = context.pending_nested_modport_analysis();
+    let pending = pending
+        .lock()
+        .expect("pending lowering mutex should be healthy");
+    assert!(pending.interface_lowering(&bad_key).is_none());
+    assert!(pending.interface_lowering(&good_key).is_some());
+}
+
+#[test]
+fn normal_conversion_finalizes_all_nested_occurrence_positions_semantically() {
+    let code = r#"
+    interface ChildIf {
+        var payload: logic<8>;
+        modport sink {
+            payload: inout,
+        }
+    }
+    interface ParentIf {
+        inst child: ChildIf;
+        modport sink {
+            child.sink: modport,
+        }
+        always_comb {
+            child.payload[0] = child.payload[1];
+        }
+    }
+    module Consumer (
+        p: modport ParentIf::sink,
+        leaf: modport ChildIf::sink,
+    ) {
+        always_comb {
+            p.child.payload[2] = p.child.payload[3];
+        }
+    }
+    module Top {
+        inst parent: ParentIf;
+        inst unrelated_parent: ParentIf;
+        inst leaf: ChildIf;
+        inst consumer: Consumer (p: parent, leaf: leaf);
+        var unrelated: logic;
+        always_comb {
+            parent.child.payload[4] = parent.child.payload[5];
+            unrelated = unrelated;
+        }
+        connect parent.child.payload <> 0;
+    }
+    "#;
+
+    symbol_table::clear();
+    attribute_table::clear();
+    let metadata = Metadata::create_default("prj").unwrap();
+    let parser = Parser::parse(code, &"").unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+    let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+    errors.append(&mut Analyzer::analyze_post_pass1());
+    errors.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+    assert!(
+        errors.iter().all(|error| matches!(
+            error,
+            AnalyzerError::UnassignVariable { .. } | AnalyzerError::MismatchType { .. }
+        )),
+        "{errors:?}"
+    );
+
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("normal conversion must resolve every semantic candidate");
+    let child = symbol_table::get_all()
+        .into_iter()
+        .find(|symbol| {
+            symbol.token.text.to_string() == "ChildIf"
+                && matches!(symbol.kind, SymbolKind::Interface(_))
+        })
+        .expect("ChildIf declaration symbol must exist");
+    let declarations = symbol_table::get_all();
+    let parent = declarations
+        .iter()
+        .find(|symbol| {
+            symbol.token.text.to_string() == "ParentIf"
+                && matches!(symbol.kind, SymbolKind::Interface(_))
+        })
+        .expect("ParentIf declaration symbol must exist");
+    let consumer = declarations
+        .iter()
+        .find(|symbol| {
+            symbol.token.text.to_string() == "Consumer"
+                && matches!(symbol.kind, SymbolKind::Module(_))
+        })
+        .expect("Consumer declaration symbol must exist");
+    let top = declarations
+        .iter()
+        .find(|symbol| {
+            symbol.token.text.to_string() == "Top" && matches!(symbol.kind, SymbolKind::Module(_))
+        })
+        .expect("Top declaration symbol must exist");
+    let mut prepared = analysis
+        .prepare_emission(
+            child
+                .token
+                .source
+                .get_path()
+                .expect("source declaration must have a path"),
+            crate::nested_modport::EmissionPhase::Align,
+        )
+        .expect("complete analysis must prepare its first emission phase");
+    let child_batch = prepared
+        .take_owners(
+            child.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+        )
+        .expect("normal analyzer conversion must publish the ChildIf owner batch");
+    let child_frames: Vec<_> = child_batch.iter().collect();
+    assert_eq!(child_frames.len(), 1);
+    assert!(matches!(
+        child_frames[0].lowering(),
+        crate::nested_modport::LoweringAvailability::NotNested
+    ));
+    let keys: Vec<_> = analysis.rewrite_keys().cloned().collect();
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.kind == crate::nested_modport::OccurrenceKind::ExpressionIdentifier)
+            .count(),
+        8
+    );
+    assert_eq!(
+        keys.iter()
+            .filter(|key| key.kind == crate::nested_modport::OccurrenceKind::HierarchicalIdentifier)
+            .count(),
+        1
+    );
+    let mut consumed: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            let rewrite = analysis
+                .rewrite(key)
+                .expect("enumerated semantic key must be queryable");
+            assert_eq!(rewrite.semantic_segments.len(), 2);
+            assert_eq!(rewrite.replace_from_segment, 0);
+            rewrite.consumed_segments
+        })
+        .collect();
+    consumed.sort_unstable();
+    assert_eq!(consumed, vec![2, 2, 3, 3, 3, 3, 3, 3, 3]);
+    let expanded: Vec<_> = analysis
+        .expanded_port_keys()
+        .map(|key| {
+            analysis
+                .expanded_port(key)
+                .expect("expanded key must query")
+        })
+        .collect();
+    assert_eq!(expanded.len(), 6);
+    assert_eq!(
+        expanded
+            .iter()
+            .filter(|resolution| matches!(
+                resolution,
+                crate::nested_modport::ExpandedPortResolution::Nested { .. }
+            ))
+            .count(),
+        3
+    );
+    assert_eq!(
+        expanded
+            .iter()
+            .filter(|resolution| matches!(
+                resolution,
+                crate::nested_modport::ExpandedPortResolution::DirectLegacy
+            ))
+            .count(),
+        3
+    );
+
+    let parent_frames: Vec<_> = prepared
+        .take_owners(
+            parent.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+        )
+        .expect("ParentIf owner batch must follow ChildIf")
+        .iter()
+        .collect();
+    let consumer_frames: Vec<_> = prepared
+        .take_owners(
+            consumer.token.id,
+            crate::nested_modport::EmissionOwnerKind::Module,
+        )
+        .expect("Consumer owner batch must follow ParentIf")
+        .iter()
+        .collect();
+    let top_frames: Vec<_> = prepared
+        .take_owners(
+            top.token.id,
+            crate::nested_modport::EmissionOwnerKind::Module,
+        )
+        .expect("Top owner batch must follow Consumer")
+        .iter()
+        .collect();
+    assert_eq!(parent_frames.len(), 1);
+    assert_eq!(consumer_frames.len(), 1);
+    assert_eq!(top_frames.len(), 1);
+    let parent_lowering = analysis
+        .lowering(parent_frames[0].specialization())
+        .expect("nested ParentIf owner must publish its lowering");
+    assert!(matches!(
+        parent_frames[0].lowering(),
+        crate::nested_modport::LoweringAvailability::Found(lowering)
+            if std::sync::Arc::ptr_eq(lowering, parent_lowering)
+    ));
+
+    let frames: Vec<_> = child_frames
+        .iter()
+        .chain(&parent_frames)
+        .chain(&consumer_frames)
+        .chain(&top_frames)
+        .copied()
+        .collect();
+    let mut ids: Vec<_> = frames.iter().map(|frame| frame.id()).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), frames.len());
+    for frame in &frames {
+        assert_eq!(
+            frame.emission_context().owner,
+            frame.specialization().specialization.owner
+        );
+        for key in keys
+            .iter()
+            .filter(|key| &key.owner == frame.specialization())
+        {
+            assert!(
+                frame
+                    .rewrite(key.kind, key.token)
+                    .expect("owner-required rewrite must be queryable")
+                    .is_some()
+            );
+        }
+        for key in analysis
+            .expanded_port_keys()
+            .filter(|key| &key.owner == frame.specialization())
+        {
+            assert!(
+                frame
+                    .expanded_port(key.token)
+                    .expect("owner-required expanded port must be queryable")
+                    .is_some()
+            );
+        }
+    }
+    assert!(matches!(
+        child_frames[0].rewrite(keys[0].kind, keys[0].token),
+        Err(crate::nested_modport::NestedModportAnalysisInvariant::RecordNotRequired)
+    ));
+    prepared
+        .finish()
+        .expect("Align must consume every analyzer-owned batch");
+
+    let mut build = analysis
+        .prepare_emission(
+            child
+                .token
+                .source
+                .get_path()
+                .expect("source path must exist"),
+            crate::nested_modport::EmissionPhase::Build,
+        )
+        .expect("Build must prepare independently after Align");
+    for (declaration, kind, expected) in [
+        (
+            child.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+            1,
+        ),
+        (
+            parent.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+            1,
+        ),
+        (
+            consumer.token.id,
+            crate::nested_modport::EmissionOwnerKind::Module,
+            1,
+        ),
+        (
+            top.token.id,
+            crate::nested_modport::EmissionOwnerKind::Module,
+            1,
+        ),
+    ] {
+        assert_eq!(
+            build
+                .take_owners(declaration, kind)
+                .expect("Build must see the same ordered batch set")
+                .iter()
+                .count(),
+            expected
+        );
+    }
+    build
+        .finish()
+        .expect("Build must consume independently from Align");
+}
+
+#[test]
+fn named_and_positional_generic_expanded_ports_keep_distinct_targets() {
+    let code = r#"
+    interface ChildIf::<W: u32> {
+        var payload: logic<W>;
+        modport sink {
+            payload: input,
+        }
+    }
+    interface ParentIf::<W: u32> {
+        inst child: ChildIf::<W>;
+        modport sink {
+            child.sink: modport,
+        }
+    }
+    module Consumer::<W: u32> (
+        p: modport ParentIf::<W>::sink,
+    ) {}
+    module Use8 {
+        inst p: ParentIf::<8>;
+        inst named8: Consumer::<8> (p: p);
+        inst shorthand8: Consumer::<8> (p);
+    }
+    module Use16 {
+        inst p: ParentIf::<16>;
+        inst named16: Consumer::<16> (p: p);
+        inst shorthand16: Consumer::<16> (p);
+    }
+    module Top {
+        inst use8: Use8;
+        inst use16: Use16;
+    }
+    "#;
+
+    symbol_table::clear();
+    attribute_table::clear();
+    let metadata = Metadata::create_default("prj").unwrap();
+    let parser = Parser::parse(code, &"").unwrap();
+    let analyzer = Analyzer::new(&metadata);
+    let mut context = Context::default();
+    let mut ir = Ir::default();
+    let mut errors = analyzer.analyze_pass1("prj", &parser.veryl);
+    errors.append(&mut Analyzer::analyze_post_pass1());
+    errors.append(&mut analyzer.analyze_pass2(&parser.veryl, &mut context, Some(&mut ir)));
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error, AnalyzerError::UnassignVariable { .. })),
+        "{errors:?}"
+    );
+
+    let analysis = context
+        .finish_nested_modport_analysis()
+        .expect("both generic expanded ports must resolve");
+    let resolutions: Vec<_> = analysis
+        .expanded_port_keys()
+        .map(|key| {
+            (
+                key,
+                analysis
+                    .expanded_port(key)
+                    .expect("enumerated expanded port must remain queryable"),
+            )
+        })
+        .collect();
+    assert_eq!(resolutions.len(), 4, "{resolutions:?}");
+    let consumer_resolutions: Vec<_> = resolutions
+        .iter()
+        .filter(|(key, _)| !key.owner.specialization.connected_actuals.is_empty())
+        .collect();
+    assert_eq!(consumer_resolutions.len(), 2, "{resolutions:?}");
+    let targets: Vec<_> = consumer_resolutions
+        .iter()
+        .map(|(_, resolution)| match *resolution {
+            crate::nested_modport::ExpandedPortResolution::Nested { target, .. } => target.clone(),
+            crate::nested_modport::ExpandedPortResolution::DirectLegacy => {
+                panic!("generic ParentIf is nested-required")
+            }
+        })
+        .collect();
+    assert_ne!(
+        targets[0].specialization.owner,
+        targets[1].specialization.owner
+    );
+    let mut terminal_widths: Vec<_> = targets
+        .iter()
+        .map(|target| {
+            analysis
+                .lowering(target)
+                .expect("generic target lowering must be registered")
+                .terminals[0]
+                .resolved_type
+                .declaration
+                .packed
+                .as_slice()[0]
+                .expect("generic width must be concrete")
+        })
+        .collect();
+    terminal_widths.sort_unstable();
+    assert_eq!(terminal_widths, [8, 16]);
+
+    let declarations = symbol_table::get_all();
+    let declaration = |name: &str| {
+        declarations
+            .iter()
+            .find(|symbol| symbol.token.text.to_string() == name)
+            .unwrap_or_else(|| panic!("{name} declaration symbol must exist"))
+    };
+    let child = declaration("ChildIf");
+    let parent = declaration("ParentIf");
+    let consumer = declaration("Consumer");
+    let use8 = declaration("Use8");
+    let use16 = declaration("Use16");
+    let top = declaration("Top");
+    let source = child
+        .token
+        .source
+        .get_path()
+        .expect("generic fixture source path must exist");
+    let mut prepared = analysis
+        .prepare_emission(source, crate::nested_modport::EmissionPhase::Align)
+        .expect("generic fixture must preflight");
+    let child_frames: Vec<_> = prepared
+        .take_owners(
+            child.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+        )
+        .expect("ChildIf generic batch must be first")
+        .iter()
+        .collect();
+    let parent_frames: Vec<_> = prepared
+        .take_owners(
+            parent.token.id,
+            crate::nested_modport::EmissionOwnerKind::Interface,
+        )
+        .expect("ParentIf generic batch must follow ChildIf")
+        .iter()
+        .collect();
+    let consumer_frames: Vec<_> = prepared
+        .take_owners(
+            consumer.token.id,
+            crate::nested_modport::EmissionOwnerKind::Module,
+        )
+        .expect("Consumer generic batch must follow ParentIf")
+        .iter()
+        .collect();
+    assert_eq!(child_frames.len(), 2);
+    assert_eq!(parent_frames.len(), 2);
+    assert_eq!(consumer_frames.len(), 2);
+    assert!(
+        child_frames
+            .iter()
+            .chain(&parent_frames)
+            .chain(&consumer_frames)
+            .all(|frame| frame.emission_context().generic_map.id.is_some())
+    );
+    for frame in &consumer_frames {
+        let owner = &frame.specialization().specialization.owner;
+        assert_eq!(frame.emission_context().owner, *owner);
+        assert_eq!(owner.generic_parameters.len(), 1);
+        let (generic_name, generic_value) = &owner.generic_parameters[0];
+        assert_eq!(
+            frame.emission_context().generic_map.map.get(generic_name),
+            Some(generic_value)
+        );
+        let connected = &frame.specialization().specialization.connected_actuals;
+        assert_eq!(connected.len(), 1);
+        let (_, resolution) = resolutions
+            .iter()
+            .find(|(key, _)| &key.owner == frame.specialization())
+            .expect("each generic Consumer owner must own one expanded port");
+        let crate::nested_modport::ExpandedPortResolution::Nested { target, .. } = resolution
+        else {
+            panic!("generic Consumer port must target nested ParentIf")
+        };
+        assert_eq!(connected[0].actual, target.specialization.owner);
+        assert!(
+            frame
+                .expanded_port(
+                    resolutions
+                        .iter()
+                        .find(|(key, _)| &key.owner == frame.specialization())
+                        .expect("expanded port key must exist")
+                        .0
+                        .token,
+                )
+                .expect("expanded port must be required by its frame")
+                .is_some()
+        );
+    }
+    for (symbol, expected) in [(use8, 1), (use16, 1), (top, 1)] {
+        assert_eq!(
+            prepared
+                .take_owners(
+                    symbol.token.id,
+                    crate::nested_modport::EmissionOwnerKind::Module,
+                )
+                .expect("ordinary module batch must remain ordered")
+                .iter()
+                .count(),
+            expected
+        );
+    }
+    prepared
+        .finish()
+        .expect("generic fixture must consume every owner batch");
 }
 
 #[test]

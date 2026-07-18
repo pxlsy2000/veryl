@@ -71,9 +71,31 @@ fn empty_body_with_comment() {
 fn nested_modport_item_path_format() {
     let metadata = Metadata::create_default("prj").unwrap();
 
-    // Given: a nested modport item path and a direct item with cramped spacing.
-    let code = r#"interface CpuIf{var fatal:logic;modport sink{fatal:input}}
-interface IrqIf{var fatal:logic;inst cpu:CpuIf;modport sink{cpu.sink:modport,fatal:input}}
+    // Given: unequal direct and dotted paths alongside an attributed group and default.
+    let code = r#"interface CpuIf {
+    var fatal: logic;
+    modport sink {
+        fatal: input,
+    }
+}
+interface IrqIf {
+    var fatal    : logic;
+    var long_name: logic;
+    inst cpu: CpuIf;
+    modport base {
+        fatal: input,
+    }
+    modport sink {
+        fatal: input,
+        cpu.sink: modport,
+        #[ifdef(ENABLE)]
+        {
+            long_name: output,
+            cpu.sink: modport,
+        },
+        ..same(base)
+    }
+}
 "#;
 
     let expect = r#"interface CpuIf {
@@ -83,20 +105,32 @@ interface IrqIf{var fatal:logic;inst cpu:CpuIf;modport sink{cpu.sink:modport,fat
     }
 }
 interface IrqIf {
-    var fatal: logic;
+    var fatal    : logic;
+    var long_name: logic;
     inst cpu: CpuIf;
-    modport sink {
-        cpu.sink: modport,
+    modport base {
         fatal: input,
+    }
+    modport sink {
+        fatal   : input  ,
+        cpu.sink: modport,
+        #[ifdef(ENABLE)]
+        {
+            long_name: output ,
+            cpu.sink : modport,
+        },
+        ..same(base)
     }
 }
 "#;
 
-    // When: the formatter round-trips the source.
-    let ret = format(&metadata, code);
+    // When: the formatter runs twice.
+    let first = format(&metadata, code);
+    let second = format(&metadata, &first);
 
-    // Then: nested and direct modport members use the same spacing rules.
-    assert_eq!(ret, expect);
+    // Then: each dotted path is one aligned identifier field and formatting is stable.
+    assert_eq!(first, expect);
+    assert_eq!(second, expect);
 }
 
 #[test]

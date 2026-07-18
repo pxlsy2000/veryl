@@ -5,7 +5,8 @@ use crate::conv::utils::eval_width_select;
 use crate::ir::{
     AssignDestination, Comptime, Expression, Factor, Op, Shape, ShapeRef, Type, TypeKind,
 };
-use crate::symbol::Affiliation;
+use crate::symbol::{Affiliation, SymbolId};
+use crate::symbol_table;
 use crate::value::{Value, ValueBigUint};
 use std::fmt;
 use veryl_parser::resource_table::{self, StrId};
@@ -868,12 +869,14 @@ impl fmt::Display for VarKind {
 #[derive(Clone)]
 pub struct Variable {
     pub id: VarId,
+    pub symbol: Option<SymbolId>,
     pub path: VarPath,
     pub kind: VarKind,
     pub r#type: Type,
     pub value: Vec<Value>,
     pub assigned: Vec<BigUint>,
     pub affiliation: Affiliation,
+    pub declaration_token: TokenRange,
     pub token: TokenRange,
 }
 
@@ -903,12 +906,16 @@ impl Variable {
 
         Self {
             id,
+            symbol: symbol_table::resolve(&token.beg)
+                .ok()
+                .map(|resolved| resolved.found.id),
             path,
             kind,
             r#type,
             value,
             assigned,
             affiliation,
+            declaration_token: *token,
             token: *token,
         }
     }
